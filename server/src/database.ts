@@ -11,6 +11,7 @@ import {
   PluginContext,
   PluginTriggerType,
   SharedLinkType,
+  SharingPermission,
   SourceType,
   UserAvatarColor,
   UserStatus,
@@ -213,6 +214,7 @@ export type Partner = {
   updatedAt: Date;
   updateId: string;
   inTimeline: boolean;
+  permissions: SharingPermission[];
 };
 
 export type Place = {
@@ -268,7 +270,7 @@ export type AssetFace = {
   boundingBoxY2: number;
   imageHeight: number;
   imageWidth: number;
-  personId: string | null;
+  faceClusterId: string | null;
   sourceType: SourceType;
   person?: ShallowDehydrateObject<Person> | null;
   updatedAt: Date;

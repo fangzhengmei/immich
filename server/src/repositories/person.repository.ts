@@ -4,7 +4,8 @@ import { jsonObjectFrom } from 'kysely/helpers/postgres';
 import { InjectKysely } from 'nestjs-kysely';
 import { AssetFace } from 'src/database';
 import { Chunked, ChunkedArray, DummyValue, GenerateSql } from 'src/decorators';
-import { AssetFileType, AssetVisibility, SourceType } from 'src/enum';
+import { AssetFileType, AssetVisibility, SharingPermission, SourceType } from 'src/enum';
+import { hasAssetPermissions } from 'src/repositories/asset.repository';
 import { DB } from 'src/schema';
 import { AssetFaceTable } from 'src/schema/tables/asset-face.table';
 import { FaceSearchTable } from 'src/schema/tables/face-search.table';
@@ -33,9 +34,9 @@ export interface AssetFaceId {
 }
 
 export interface UpdateFacesData {
-  oldPersonId?: string;
+  oldFaceClusterId?: string;
   faceIds?: string[];
-  newPersonId: string;
+  newFaceClusterId: string;
 }
 
 export interface PersonStatistics {
@@ -54,7 +55,7 @@ export interface GetAllPeopleOptions {
 }
 
 export interface GetAllFacesOptions {
-  personId?: string | null;
+  faceClusterId?: string | null;
   assetId?: string;
   sourceType?: SourceType;
 }
@@ -65,7 +66,7 @@ export type SelectFaceOptions = (keyof Selectable<AssetFaceTable>)[];
 
 const withPerson = (eb: ExpressionBuilder<DB, 'asset_face'>) => {
   return jsonObjectFrom(
-    eb.selectFrom('person').selectAll('person').whereRef('person.id', '=', 'asset_face.personId'),
+    eb.selectFrom('person').selectAll('person').whereRef('person.faceClusterId', '=', 'asset_face.faceClusterId'),
   ).as('person');
 };
 
@@ -75,16 +76,47 @@ const withFaceSearch = (eb: ExpressionBuilder<DB, 'asset_face'>) => {
   ).as('faceSearch');
 };
 
+export const hasPermissions =
+  (userId: string, permissions: SharingPermission[]) => (eb: ExpressionBuilder<DB, 'person'>) =>
+    eb.or([
+      eb.exists((eb) =>
+        eb
+          .selectFrom('partner')
+          .whereRef('partner.sharedById', '=', 'person.ownerId')
+          .where('partner.sharedWithId', '=', userId)
+          .where((eb) =>
+            eb.or([
+              eb(eb.val(SharingPermission.All), '=', eb.fn.any('partner.permissions')),
+              eb('partner.permissions', '@>', eb.val(permissions)),
+            ]),
+          ),
+      ),
+      eb.exists((eb) =>
+        eb
+          .selectFrom('album_user')
+          .where('album_user.albumId', 'in', (eb) =>
+            eb.selectFrom('album_user').select('album_user.albumId').where('album_user.userId', '=', userId),
+          )
+          .whereRef('album_user.userId', '=', 'person.ownerId')
+          .where((eb) =>
+            eb.or([
+              eb(eb.val(SharingPermission.All), '=', eb.fn.any('album_user.permissions')),
+              eb('album_user.permissions', '@>', eb.val(permissions)),
+            ]),
+          ),
+      ),
+    ]);
+
 @Injectable()
 export class PersonRepository {
   constructor(@InjectKysely() private db: Kysely<DB>) {}
 
   @GenerateSql({ params: [{ oldPersonId: DummyValue.UUID, newPersonId: DummyValue.UUID }] })
-  async reassignFaces({ oldPersonId, faceIds, newPersonId }: UpdateFacesData): Promise<number> {
+  async reassignFaces({ oldFaceClusterId, faceIds, newFaceClusterId }: UpdateFacesData): Promise<number> {
     const result = await this.db
       .updateTable('asset_face')
-      .set({ personId: newPersonId })
-      .$if(!!oldPersonId, (qb) => qb.where('asset_face.personId', '=', oldPersonId!))
+      .set({ faceClusterId: newFaceClusterId })
+      .$if(!!oldFaceClusterId, (qb) => qb.where('asset_face.faceClusterId', '=', oldFaceClusterId!))
       .$if(!!faceIds, (qb) => qb.where('asset_face.id', 'in', faceIds!))
       .executeTakeFirst();
 
@@ -94,7 +126,7 @@ export class PersonRepository {
   async unassignFaces({ sourceType }: UnassignFacesOptions): Promise<void> {
     await this.db
       .updateTable('asset_face')
-      .set({ personId: null })
+      .set({ faceClusterId: null })
       .where('asset_face.sourceType', '=', sourceType)
       .execute();
   }
@@ -117,8 +149,8 @@ export class PersonRepository {
     return this.db
       .selectFrom('asset_face')
       .selectAll('asset_face')
-      .$if(options.personId === null, (qb) => qb.where('asset_face.personId', 'is', null))
-      .$if(!!options.personId, (qb) => qb.where('asset_face.personId', '=', options.personId!))
+      .$if(options.faceClusterId === null, (qb) => qb.where('asset_face.faceClusterId', 'is', null))
+      .$if(!!options.faceClusterId, (qb) => qb.where('asset_face.faceClusterId', '=', options.faceClusterId!))
       .$if(!!options.sourceType, (qb) => qb.where('asset_face.sourceType', '=', options.sourceType!))
       .$if(!!options.assetId, (qb) => qb.where('asset_face.assetId', '=', options.assetId!))
       .where('asset_face.deletedAt', 'is', null)
@@ -153,16 +185,19 @@ export class PersonRepository {
     const items = await this.db
       .selectFrom('person')
       .selectAll('person')
-      .innerJoin('asset_face', 'asset_face.personId', 'person.id')
+      .innerJoin('asset_face', 'asset_face.faceClusterId', 'person.faceClusterId')
       .innerJoin('asset', (join) =>
         join
           .onRef('asset_face.assetId', '=', 'asset.id')
           .on('asset.visibility', '=', sql.lit(AssetVisibility.Timeline))
           .on('asset.deletedAt', 'is', null),
       )
-      .where('person.ownerId', '=', userId)
+      .where((eb) =>
+        eb.or([eb('person.ownerId', '=', userId), hasPermissions(userId, [SharingPermission.PersonRead])(eb)]),
+      )
       .where('asset_face.deletedAt', 'is', null)
       .where('asset_face.isVisible', 'is', true)
+      .orderBy((eb) => eb('person.ownerId', '=', userId), 'desc')
       .orderBy('person.isHidden', 'asc')
       .orderBy('person.isFavorite', 'desc')
       .having((eb) =>
@@ -209,7 +244,7 @@ export class PersonRepository {
     return this.db
       .selectFrom('person')
       .selectAll('person')
-      .leftJoin('asset_face', 'asset_face.personId', 'person.id')
+      .leftJoin('asset_face', 'asset_face.faceClusterId', 'person.faceClusterId')
       .where('asset_face.deletedAt', 'is', null)
       .where('asset_face.isVisible', 'is', true)
       .having((eb) => eb.fn.count('asset_face.assetId'), '=', 0)
@@ -248,7 +283,7 @@ export class PersonRepository {
   getFaceForFacialRecognitionJob(id: string) {
     return this.db
       .selectFrom('asset_face')
-      .select(['asset_face.id', 'asset_face.personId', 'asset_face.sourceType'])
+      .select(['asset_face.id', 'asset_face.faceClusterId', 'asset_face.sourceType'])
       .select((eb) =>
         jsonObjectFrom(
           eb
@@ -289,10 +324,10 @@ export class PersonRepository {
   }
 
   @GenerateSql({ params: [DummyValue.UUID, DummyValue.UUID] })
-  async reassignFace(assetFaceId: string, newPersonId: string): Promise<number> {
+  async reassignFace(assetFaceId: string, newFaceClusterId: string): Promise<number> {
     const result = await this.db
       .updateTable('asset_face')
-      .set({ personId: newPersonId })
+      .set({ faceClusterId: newFaceClusterId })
       .where('asset_face.id', '=', assetFaceId)
       .executeTakeFirst();
 
@@ -318,6 +353,7 @@ export class PersonRepository {
       .where('person.ownerId', '=', userId)
       .where(() => sql`f_unaccent("person"."name") %> f_unaccent(${personName})`)
       .orderBy(sql`f_unaccent("person"."name") <->>> f_unaccent(${personName})`)
+      .orderBy((eb) => eb('person.ownerId', '=', userId), 'desc')
       .limit(100)
       .$if(!withHidden, (qb) => qb.where('person.isHidden', '=', false))
       .execute();
@@ -335,7 +371,7 @@ export class PersonRepository {
   }
 
   @GenerateSql({ params: [DummyValue.UUID] })
-  async getStatistics(personId: string): Promise<PersonStatistics> {
+  async getStatistics(userId: string, faceClusterId: string): Promise<PersonStatistics> {
     const result = await this.db
       .selectFrom('asset_face')
       .leftJoin('asset', (join) =>
@@ -344,10 +380,11 @@ export class PersonRepository {
           .on('asset.visibility', '=', sql.lit(AssetVisibility.Timeline))
           .on('asset.deletedAt', 'is', null),
       )
+      .where(hasAssetPermissions(userId, [SharingPermission.AssetRead], true))
       .select((eb) => eb.fn.count(eb.fn('distinct', ['asset.id'])).as('count'))
       .where('asset_face.deletedAt', 'is', null)
       .where('asset_face.isVisible', 'is', true)
-      .where('asset_face.personId', '=', personId)
+      .where('asset_face.faceClusterId', '=', faceClusterId)
       .executeTakeFirst();
 
     return {
@@ -364,7 +401,7 @@ export class PersonRepository {
         eb.exists((eb) =>
           eb
             .selectFrom('asset_face')
-            .whereRef('asset_face.personId', '=', 'person.id')
+            .whereRef('asset_face.faceClusterId', '=', 'person.faceClusterId')
             .where('asset_face.deletedAt', 'is', null)
             .where('asset_face.isVisible', '=', true)
             .where((eb) =>
@@ -378,13 +415,20 @@ export class PersonRepository {
             ),
         ),
       )
-      .where('person.ownerId', '=', userId)
+      .where((eb) =>
+        eb.or([eb('person.ownerId', '=', userId), hasPermissions(userId, [SharingPermission.PersonRead])(eb)]),
+      )
       .select((eb) => eb.fn.coalesce(eb.fn.countAll<number>(), zero).as('total'))
       .select((eb) => eb.fn.coalesce(eb.fn.countAll<number>().filterWhere('isHidden', '=', true), zero).as('hidden'))
       .executeTakeFirstOrThrow();
   }
 
-  create(person: Insertable<PersonTable>) {
+  async create(person: Insertable<PersonTable>) {
+    if (!person.faceClusterId) {
+      const { id } = await this.db.insertInto('face_cluster').values({}).returning('id').executeTakeFirstOrThrow();
+      person.faceClusterId = id;
+    }
+
     return this.db.insertInto('person').values(person).returningAll().executeTakeFirstOrThrow();
   }
 
@@ -475,18 +519,19 @@ export class PersonRepository {
       .selectFrom('asset_face')
       .selectAll('asset_face')
       .select(withPerson)
+      .innerJoin('person', (join) => join.onRef('person.faceClusterId', '=', 'asset_face.faceClusterId'))
+      .where('person.id', 'in', personIds)
       .where('asset_face.assetId', 'in', assetIds)
-      .where('asset_face.personId', 'in', personIds)
       .where('asset_face.deletedAt', 'is', null)
       .execute();
   }
 
   @GenerateSql({ params: [DummyValue.UUID] })
-  getRandomFace(personId: string) {
+  getRandomFace(faceClusterId: string) {
     return this.db
       .selectFrom('asset_face')
       .selectAll('asset_face')
-      .where('asset_face.personId', '=', personId)
+      .where('asset_face.faceClusterId', '=', faceClusterId)
       .where('asset_face.deletedAt', 'is', null)
       .where('asset_face.isVisible', 'is', true)
       .executeTakeFirst();
@@ -573,7 +618,9 @@ export class PersonRepository {
       .selectFrom('asset_face')
       .select('asset_face.id')
       .where('asset_face.assetId', '=', assetId)
-      .where('asset_face.personId', '=', personId)
+      .innerJoin('person', (join) =>
+        join.onRef('person.faceClusterId', '=', 'asset_face.faceClusterId').on('person.id', '=', personId),
+      )
       .innerJoin('asset', (join) => join.onRef('asset.id', '=', 'asset_face.assetId').on('asset.isOffline', '=', false))
       .executeTakeFirst();
   }

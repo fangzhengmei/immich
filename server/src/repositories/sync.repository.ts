@@ -443,7 +443,7 @@ class AssetFaceSync extends BaseSync {
       .select([
         'asset_face.id',
         'assetId',
-        'personId',
+        'faceClusterId',
         'imageWidth',
         'imageHeight',
         'boundingBoxX1',

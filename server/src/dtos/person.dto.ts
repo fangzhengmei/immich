@@ -40,11 +40,11 @@ const PeopleUpdateSchema = z
   })
   .meta({ id: 'PeopleUpdateDto' });
 
-const MergePersonSchema = z
+const MergeFaceClusterSchema = z
   .object({
-    ids: z.array(z.uuidv4()).describe('Person IDs to merge'),
+    ids: z.array(z.uuidv4()).describe('Face cluster IDs to merge'),
   })
-  .meta({ id: 'MergePersonDto' });
+  .meta({ id: 'MergeFaceClusterDto' });
 
 const PersonSearchSchema = z
   .object({
@@ -87,7 +87,7 @@ const PersonResponseSchema = z
 export class PersonCreateDto extends createZodDto(PersonCreateSchema) {}
 export class PersonUpdateDto extends createZodDto(PersonUpdateSchema) {}
 export class PeopleUpdateDto extends createZodDto(PeopleUpdateSchema) {}
-export class MergePersonDto extends createZodDto(MergePersonSchema) {}
+export class MergeFaceClusterDto extends createZodDto(MergeFaceClusterSchema) {}
 export class PersonSearchDto extends createZodDto(PersonSearchSchema) {}
 export class PersonResponseDto extends createZodDto(PersonResponseSchema) {}
 

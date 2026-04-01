@@ -73,11 +73,13 @@
     mdiLink,
     mdiPlus,
     mdiPresentationPlay,
+    mdiShareVariant,
   } from '@mdi/js';
   import { onDestroy } from 'svelte';
   import { t } from 'svelte-i18n';
   import { fly } from 'svelte/transition';
   import type { PageData } from './$types';
+  import SharingOptionsModal from '$lib/modals/SharingOptionsModal.svelte';
 
   interface Props {
     data: PageData;
@@ -405,9 +407,16 @@
                     {/if}
                   </button>
 
-                  {#if isOwned}
-                    <ActionButton action={Share} />
-                  {/if}
+                  <IconButton
+                    shape="round"
+                    aria-label="Sharing permissions"
+                    color="secondary"
+                    size="medium"
+                    icon={mdiShareVariant}
+                    onclick={() => modalManager.show(SharingOptionsModal, { albumId: album.id })}
+                  />
+
+                  <ActionButton action={Share} />
                 </div>
               {/if}
               <AlbumDescription

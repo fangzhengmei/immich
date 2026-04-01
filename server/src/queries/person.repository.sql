@@ -3,9 +3,6 @@
 -- PersonRepository.reassignFaces
 update "asset_face"
 set
-  "personId" = $1
-where
-  "asset_face"."personId" = $2
 
 -- PersonRepository.delete
 delete from "person"
@@ -28,23 +25,59 @@ select
   "person".*
 from
   "person"
-  inner join "asset_face" on "asset_face"."personId" = "person"."id"
+  inner join "asset_face" on "asset_face"."faceClusterId" = "person"."faceClusterId"
   inner join "asset" on "asset_face"."assetId" = "asset"."id"
   and "asset"."visibility" = 'timeline'
   and "asset"."deletedAt" is null
 where
-  "person"."ownerId" = $1
+  (
+    "person"."ownerId" = $1
+    or (
+      exists (
+        select
+        from
+          "partner"
+        where
+          "partner"."sharedById" = "person"."ownerId"
+          and "partner"."sharedWithId" = $2
+          and (
+            $3 = any ("partner"."permissions")
+            or "partner"."permissions" @> $4
+          )
+      )
+      or exists (
+        select
+        from
+          "album_user"
+        where
+          "album_user"."albumId" in (
+            select
+              "album_user"."albumId"
+            from
+              "album_user"
+            where
+              "album_user"."userId" = $5
+          )
+          and "album_user"."userId" = "person"."ownerId"
+          and (
+            $6 = any ("album_user"."permissions")
+            or "album_user"."permissions" @> $7
+          )
+      )
+    )
+  )
   and "asset_face"."deletedAt" is null
   and "asset_face"."isVisible" is true
-  and "person"."isHidden" = $2
+  and "person"."isHidden" = $8
 group by
   "person"."id"
 having
   (
-    "person"."name" != $3
-    or count("asset_face"."assetId") >= $4
+    "person"."name" != $9
+    or count("asset_face"."assetId") >= $10
   )
 order by
+  "person"."ownerId" = $11 desc,
   "person"."isHidden" asc,
   "person"."isFavorite" desc,
   NULLIF(person.name, '') is null asc,
@@ -52,16 +85,16 @@ order by
   NULLIF(person.name, '') asc nulls last,
   "person"."createdAt"
 limit
-  $5
+  $12
 offset
-  $6
+  $13
 
 -- PersonRepository.getAllWithoutFaces
 select
   "person".*
 from
   "person"
-  left join "asset_face" on "asset_face"."personId" = "person"."id"
+  left join "asset_face" on "asset_face"."faceClusterId" = "person"."faceClusterId"
 where
   "asset_face"."deletedAt" is null
   and "asset_face"."isVisible" is true
@@ -83,7 +116,7 @@ select
         from
           "person"
         where
-          "person"."id" = "asset_face"."personId"
+          "person"."faceClusterId" = "asset_face"."faceClusterId"
       ) as obj
   ) as "person"
 from
@@ -108,7 +141,7 @@ select
         from
           "person"
         where
-          "person"."id" = "asset_face"."personId"
+          "person"."faceClusterId" = "asset_face"."faceClusterId"
       ) as obj
   ) as "person"
 from
@@ -120,7 +153,7 @@ where
 -- PersonRepository.getFaceForFacialRecognitionJob
 select
   "asset_face"."id",
-  "asset_face"."personId",
+  "asset_face"."faceClusterId",
   "asset_face"."sourceType",
   (
     select
@@ -190,7 +223,7 @@ where
 -- PersonRepository.reassignFace
 update "asset_face"
 set
-  "personId" = $1
+  "faceClusterId" = $1
 where
   "asset_face"."id" = $2
 
@@ -209,9 +242,10 @@ where
   "person"."ownerId" = $1
   and f_unaccent ("person"."name") %> f_unaccent ($2)
 order by
-  f_unaccent ("person"."name") <->>> f_unaccent ($3)
+  f_unaccent ("person"."name") <->>> f_unaccent ($3),
+  "person"."ownerId" = $4 desc
 limit
-  $4
+  $5
 
 -- PersonRepository.getDistinctNames
 select distinct
@@ -234,9 +268,45 @@ from
   and "asset"."visibility" = 'timeline'
   and "asset"."deletedAt" is null
 where
-  "asset_face"."deletedAt" is null
+  (
+    "asset"."ownerId" = $1
+    or exists (
+      select
+      from
+        "partner"
+      where
+        "partner"."sharedById" = "asset"."ownerId"
+        and "partner"."sharedWithId" = $2
+        and (
+          $3 = any ("partner"."permissions")
+          or "partner"."permissions" @> $4
+        )
+    )
+    or exists (
+      select
+      from
+        "album_asset"
+        inner join "album_user" on "album_user"."albumId" = "album_asset"."albumId"
+        and "album_user"."userId" = $5
+      where
+        "album_asset"."assetId" = "asset"."id"
+        and "album_user"."albumId" in (
+          select
+            "album_user"."albumId"
+          from
+            "album_user"
+          where
+            "album_user"."userId" = "asset"."ownerId"
+            and (
+              $6 = any ("album_user"."permissions")
+              or "album_user"."permissions" @> $7
+            )
+        )
+    )
+  )
+  and "asset_face"."deletedAt" is null
   and "asset_face"."isVisible" is true
-  and "asset_face"."personId" = $1
+  and "asset_face"."faceClusterId" = $8
 
 -- PersonRepository.getNumberOfPeople
 select
@@ -256,7 +326,7 @@ where
     from
       "asset_face"
     where
-      "asset_face"."personId" = "person"."id"
+      "asset_face"."faceClusterId" = "person"."faceClusterId"
       and "asset_face"."deletedAt" is null
       and "asset_face"."isVisible" = $2
       and exists (
@@ -269,7 +339,42 @@ where
           and "asset"."deletedAt" is null
       )
   )
-  and "person"."ownerId" = $3
+  and (
+    "person"."ownerId" = $3
+    or (
+      exists (
+        select
+        from
+          "partner"
+        where
+          "partner"."sharedById" = "person"."ownerId"
+          and "partner"."sharedWithId" = $4
+          and (
+            $5 = any ("partner"."permissions")
+            or "partner"."permissions" @> $6
+          )
+      )
+      or exists (
+        select
+        from
+          "album_user"
+        where
+          "album_user"."albumId" in (
+            select
+              "album_user"."albumId"
+            from
+              "album_user"
+            where
+              "album_user"."userId" = $7
+          )
+          and "album_user"."userId" = "person"."ownerId"
+          and (
+            $8 = any ("album_user"."permissions")
+            or "album_user"."permissions" @> $9
+          )
+      )
+    )
+  )
 
 -- PersonRepository.refreshFaces
 with
@@ -299,14 +404,15 @@ select
         from
           "person"
         where
-          "person"."id" = "asset_face"."personId"
+          "person"."faceClusterId" = "asset_face"."faceClusterId"
       ) as obj
   ) as "person"
 from
   "asset_face"
+  inner join "person" on "person"."faceClusterId" = "asset_face"."faceClusterId"
 where
-  "asset_face"."assetId" in ($1)
-  and "asset_face"."personId" in ($2)
+  "person"."id" in ($1)
+  and "asset_face"."assetId" in ($2)
   and "asset_face"."deletedAt" is null
 
 -- PersonRepository.getRandomFace
@@ -315,7 +421,7 @@ select
 from
   "asset_face"
 where
-  "asset_face"."personId" = $1
+  "asset_face"."faceClusterId" = $1
   and "asset_face"."deletedAt" is null
   and "asset_face"."isVisible" is true
 
@@ -351,8 +457,9 @@ select
   "asset_face"."id"
 from
   "asset_face"
+  inner join "person" on "person"."faceClusterId" = "asset_face"."faceClusterId"
+  and "person"."id" = $1
   inner join "asset" on "asset"."id" = "asset_face"."assetId"
-  and "asset"."isOffline" = $1
+  and "asset"."isOffline" = $2
 where
-  "asset_face"."assetId" = $2
-  and "asset_face"."personId" = $3
+  "asset_face"."assetId" = $3
