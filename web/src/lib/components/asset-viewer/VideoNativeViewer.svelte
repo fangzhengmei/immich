@@ -5,7 +5,7 @@
   import { assetViewerManager } from '$lib/managers/asset-viewer-manager.svelte';
   import { castManager } from '$lib/managers/cast-manager.svelte';
   import { autoPlayVideo, loopVideo as loopVideoPreference } from '$lib/stores/preferences.store';
-  import { getAssetMediaUrl, getAssetPlaybackUrl } from '$lib/utils';
+  import { getAssetHlsSessionUrl, getAssetHlsUrl, getAssetMediaUrl, getAssetPlaybackUrl } from '$lib/utils';
   import { AssetMediaSize, type AssetResponseDto } from '@immich/sdk';
   import { Icon, LoadingSpinner } from '@immich/ui';
   import {
@@ -21,6 +21,9 @@
     mdiVolumeMedium,
     mdiVolumeMute,
   } from '@mdi/js';
+  import Hls, { AbrController, type HlsConfig } from 'hls.js';
+  import 'hls-video-element';
+  import type HlsVideoElement from 'hls-video-element';
   import 'media-chrome/media-control-bar';
   import 'media-chrome/media-controller';
   import 'media-chrome/media-fullscreen-button';
@@ -38,6 +41,7 @@
   import { useSwipe, type SwipeCustomEvent } from 'svelte-gestures';
   import { t } from 'svelte-i18n';
   import { fade } from 'svelte/transition';
+  import { featureFlagsManager } from '$lib/managers/feature-flags-manager.svelte';
 
   interface Props {
     asset: AssetResponseDto;
@@ -69,14 +73,105 @@
 
   let videoPlayer: HTMLVideoElement | undefined = $state();
   let isLoading = $state(true);
-  let assetFileUrl = $derived(
-    playOriginalVideo
-      ? getAssetMediaUrl({ id: assetId, size: AssetMediaSize.Original, cacheKey })
-      : getAssetPlaybackUrl({ id: assetId, cacheKey }),
-  );
+  let assetFileUrl = $derived.by(() => {
+    if (featureFlagsManager.value.realtimeTranscoding) {
+      return getAssetHlsUrl(assetId);
+    }
+
+    if (playOriginalVideo) {
+      return getAssetMediaUrl({ id: assetId, size: AssetMediaSize.Original, cacheKey });
+    }
+
+    return getAssetPlaybackUrl({ id: assetId, cacheKey });
+  });
   const aspectRatio = $derived(asset.width && asset.height ? `${asset.width} / ${asset.height}` : undefined);
   let showVideo = $state(false);
   let hasFocused = $state(false);
+  let activeSession: { assetId: string; id: string } | undefined;
+  let rebuildCount = 0;
+
+  const MAX_REBUILDS = 1;
+  const SESSION_ID_REGEX = /\/video\/stream\/([0-9a-f-]{36})\//;
+
+  // hls.js can abandon fetching an in-flight fragment if it thinks it'll take too long, in which case
+  // it emergency switches to a different variant. This extends the delay even further due to
+  // cold starting another transcode, so let the fragment finish and have steady ABR decide the next level.
+  class NoAbandonAbrController extends AbrController {
+    protected override onFragLoading() {}
+  }
+
+  const hlsConfig: Partial<HlsConfig> = {
+    abrController: NoAbandonAbrController,
+    highBufferWatchdogPeriod: 10,
+    detectStallWithCurrentTimeMs: 10_000,
+    maxBufferHole: 0.5,
+    maxBufferLength: 30,
+    maxMaxBufferLength: 60,
+    fragLoadPolicy: {
+      default: {
+        maxTimeToFirstByteMs: 30_000,
+        maxLoadTimeMs: 60_000,
+        timeoutRetry: { maxNumRetry: 5, retryDelayMs: 100, maxRetryDelayMs: 0 },
+        errorRetry: { maxNumRetry: 3, retryDelayMs: 1000, maxRetryDelayMs: 8000 },
+      },
+    },
+  };
+
+  const releaseSession = () => {
+    const session = activeSession;
+    if (!session) {
+      return;
+    }
+    activeSession = undefined;
+    const url = getAssetHlsSessionUrl(session.assetId, session.id);
+    void fetch(url, { method: 'DELETE' }).catch(() => console.warn('Failed to release HLS session', session));
+  };
+
+  const isHlsElement = (el: HTMLVideoElement | undefined): el is HlsVideoElement => {
+    return el?.tagName === 'HLS-VIDEO';
+  };
+
+  const wireHlsListeners = (el: HlsVideoElement, assetId: string, resumeTime?: number) => {
+    const api = el.api;
+    if (!api) {
+      return;
+    }
+
+    api.on(Hls.Events.MANIFEST_PARSED, () => {
+      const id = api.levels[0]?.url[0]?.match(SESSION_ID_REGEX)?.[1];
+      if (id) {
+        activeSession = { assetId, id };
+      }
+    });
+
+    api.on(Hls.Events.FRAG_LOADED, () => (rebuildCount = 0));
+
+    api.on(Hls.Events.ERROR, (_, data) => {
+      console.error('HLS error', JSON.stringify(data));
+      // 404 on a fragment can mean the server-side session has expired. Refetch
+      // master for a new session, but give up if it still 404s.
+      if (
+        !data.fatal ||
+        data.details !== Hls.ErrorDetails.FRAG_LOAD_ERROR ||
+        data.response?.code !== 404 ||
+        rebuildCount++ >= MAX_REBUILDS
+      ) {
+        return;
+      }
+      activeSession = undefined;
+      resumeTime = el.currentTime;
+      // Re-setting src triggers attributeChangedCallback → load(), which
+      // destroys the old Hls and instantiates a new one with our config.
+      const url = el.src;
+      el.removeAttribute('src');
+      el.setAttribute('src', url);
+      queueMicrotask(() => wireHlsListeners(el, assetId, resumeTime));
+    });
+
+    if (resumeTime) {
+      el.addEventListener('loadedmetadata', () => (el.currentTime = resumeTime!), { once: true });
+    }
+  };
 
   onMount(() => {
     showVideo = true;
@@ -84,10 +179,31 @@
 
   $effect(() => {
     // reactive on `assetFileUrl` changes
-    if (assetFileUrl) {
+    if (videoPlayer && assetFileUrl) {
       hasFocused = false;
-      videoPlayer?.load();
+      rebuildCount = 0;
+      releaseSession();
+      if (isHlsElement(videoPlayer)) {
+        videoPlayer.config = hlsConfig;
+        videoPlayer.src = assetFileUrl;
+        const el = videoPlayer;
+        queueMicrotask(() => wireHlsListeners(el, assetId));
+      } else {
+        videoPlayer.load();
+      }
     }
+    return releaseSession;
+  });
+
+  const onPagehide = (event: PageTransitionEvent) => {
+    if (!event.persisted) {
+      releaseSession();
+    }
+  };
+
+  $effect(() => {
+    window.addEventListener('pagehide', onPagehide);
+    return () => window.removeEventListener('pagehide', onPagehide);
   });
 
   onDestroy(() => {
@@ -171,27 +287,49 @@
         style:aspect-ratio={aspectRatio}
         defaultduration={asset.duration! / 1000}
       >
-        <video
-          bind:this={videoPlayer}
-          slot="media"
-          loop={$loopVideoPreference && loopVideo}
-          autoplay={$autoPlayVideo}
-          disablePictureInPicture
-          playsinline
-          {...useSwipe(onSwipe)}
-          class="h-full object-contain"
-          oncanplay={(e) => handleCanPlay(e.currentTarget)}
-          onended={onVideoEnded}
-          onplaying={(e) => {
-            if (!hasFocused) {
-              e.currentTarget.focus();
-              hasFocused = true;
-            }
-          }}
-          onclose={onClose}
-          poster={getAssetMediaUrl({ id: asset.id, size: AssetMediaSize.Preview, cacheKey })}
-          src={assetFileUrl}
-        ></video>
+        {#if featureFlagsManager.value.realtimeTranscoding}
+          <hls-video
+            bind:this={videoPlayer}
+            slot="media"
+            loop={$loopVideoPreference && loopVideo}
+            autoplay={$autoPlayVideo}
+            disablePictureInPicture
+            playsinline
+            {...useSwipe(onSwipe)}
+            class="h-full object-contain"
+            oncanplay={(e: Event) => handleCanPlay(e.currentTarget as HTMLVideoElement)}
+            onended={onVideoEnded}
+            onplaying={(e: Event) => {
+              if (!hasFocused) {
+                (e.currentTarget as HTMLElement).focus();
+                hasFocused = true;
+              }
+            }}
+            onclose={onClose}
+            poster={getAssetMediaUrl({ id: asset.id, size: AssetMediaSize.Preview, cacheKey })}
+          ></hls-video>
+        {:else}
+          <video
+            bind:this={videoPlayer}
+            slot="media"
+            loop={$loopVideoPreference && loopVideo}
+            autoplay={$autoPlayVideo}
+            disablePictureInPicture
+            playsinline
+            {...useSwipe(onSwipe)}
+            class="h-full object-contain"
+            oncanplay={(e) => handleCanPlay(e.currentTarget)}
+            onended={onVideoEnded}
+            onplaying={(e) => {
+              if (!hasFocused) {
+                e.currentTarget.focus();
+                hasFocused = true;
+              }
+            }}
+            onclose={onClose}
+            poster={getAssetMediaUrl({ id: asset.id, size: AssetMediaSize.Preview, cacheKey })}
+          ></video>
+        {/if}
 
         {#if extendedControls}
           <media-settings-menu hidden anchor="auto" class="w-3xs rounded-xl border border-light-300 shadow-sm">
@@ -247,7 +385,7 @@
         </div>
       {/if}
 
-      {#if assetViewerManager.isFaceEditMode}
+      {#if assetViewerManager.isFaceEditMode && videoPlayer}
         <FaceEditor htmlElement={videoPlayer} {containerWidth} {containerHeight} {assetId} />
       {/if}
     {/if}
