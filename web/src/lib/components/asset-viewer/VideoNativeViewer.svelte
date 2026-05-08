@@ -34,6 +34,7 @@
   import 'media-chrome/media-time-range';
   import 'media-chrome/media-volume-range';
   import 'media-chrome/menu/media-playback-rate-menu';
+  import 'media-chrome/menu/media-rendition-menu';
   import 'media-chrome/menu/media-settings-menu';
   import 'media-chrome/menu/media-settings-menu-button';
   import 'media-chrome/menu/media-settings-menu-item';
@@ -141,6 +142,19 @@
       const id = api.levels[0]?.url[0]?.match(SESSION_ID_REGEX)?.[1];
       if (id) {
         activeSession = { assetId, id };
+      }
+    });
+
+    // Once ABR has picked an initial codec tier, drop the others.
+    // The player already avoids switching codecs, and removing the other codecs
+    // makes the quality selector cleaner with only resolution options.
+    api.once(Hls.Events.LEVEL_SWITCHED, (_event, data) => {
+      const chosenLevel = api.levels[data.level];
+      for (let idx = api.levels.length - 1; idx >= 0; idx--) {
+        const { codecSet, videoRange } = api.levels[idx];
+        if (codecSet !== chosenLevel.codecSet || videoRange !== chosenLevel.videoRange) {
+          api.removeLevel(idx);
+        }
       }
     });
 
@@ -342,6 +356,16 @@
                 <span slot="title">{$t('playback_speed')}</span>
               </media-playback-rate-menu>
             </media-settings-menu-item>
+            {#if featureFlagsManager.value.realtimeTranscoding}
+              <media-settings-menu-item class="mx-1 rounded-lg p-1 ps-2">
+                {$t('video_quality')}
+                <Icon slot="suffix" icon={mdiChevronRight} class="m-2" />
+                <media-rendition-menu slot="submenu" hidden>
+                  <Icon slot="back-icon" icon={mdiChevronLeft} class="m-2" />
+                  <span slot="title">{$t('video_quality')}</span>
+                </media-rendition-menu>
+              </media-settings-menu-item>
+            {/if}
           </media-settings-menu>
         {/if}
 
