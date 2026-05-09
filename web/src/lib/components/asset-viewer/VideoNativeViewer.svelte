@@ -283,6 +283,44 @@
       videoPlayer?.pause();
     }
   });
+
+  // Suppress mediaseekrequest events while the user is dragging the time range and
+  // replay only the last one on pointerup.
+  const commitOnRelease = (node: HTMLElement) => {
+    let dragging = false;
+    let pending: number | undefined;
+    const onPointerDown = () => (dragging = true);
+    const onPointerUp = () => {
+      if (!dragging) {
+        return;
+      }
+      dragging = false;
+      if (pending !== undefined) {
+        node.dispatchEvent(new CustomEvent('mediaseekrequest', { composed: true, bubbles: true, detail: pending }));
+        // Update time display immediately without waiting for the new fragment to load
+        videoPlayer?.dispatchEvent(new Event('timeupdate'));
+        pending = undefined;
+      }
+    };
+    const onSeekRequest = (event: Event) => {
+      if (dragging) {
+        pending = (event as CustomEvent<number>).detail;
+        event.stopImmediatePropagation();
+      }
+    };
+    node.addEventListener('pointerdown', onPointerDown);
+    node.addEventListener('pointerup', onPointerUp);
+    node.addEventListener('pointercancel', onPointerUp);
+    node.addEventListener('mediaseekrequest', onSeekRequest, { capture: true });
+    return {
+      destroy() {
+        node.removeEventListener('pointerdown', onPointerDown);
+        node.removeEventListener('pointerup', onPointerUp);
+        node.removeEventListener('pointercancel', onPointerUp);
+        node.removeEventListener('mediaseekrequest', onSeekRequest, { capture: true });
+      },
+    };
+  };
 </script>
 
 {#if showVideo}
@@ -408,7 +446,7 @@
               <media-settings-menu-button class="shrink-0 rounded-full p-2 outline-none"></media-settings-menu-button>
             {/if}
           </media-control-bar>
-          <media-time-range class="h-8 w-full rounded-lg px-2 pb-3 outline-none"></media-time-range>
+          <media-time-range use:commitOnRelease class="h-8 w-full rounded-lg px-2 pb-3 outline-none"></media-time-range>
         </div>
       </media-controller>
 
