@@ -140,6 +140,7 @@
       return;
     }
 
+    // eslint-disable-next-line @typescript-eslint/no-misused-promises
     api.on(Hls.Events.MANIFEST_PARSED, async () => {
       // Defer hls.js's first fragment load until we filter out suboptimal variants
       api.stopLoad();
@@ -149,6 +150,7 @@
       }
 
       const decodingInfo = await Promise.all(api.levels.map((level) => mediaCapabilitiesManager.decodingInfo(level)));
+      // eslint-disable-next-line svelte/prefer-svelte-reactivity
       const lowestBitrateByHeight = new Map<number, number>();
       for (let i = 0; i < api.levels.length; i++) {
         if (!decodingInfo[i].powerEfficient) {
