@@ -43,6 +43,7 @@
   import { t } from 'svelte-i18n';
   import { fade } from 'svelte/transition';
   import { featureFlagsManager } from '$lib/managers/feature-flags-manager.svelte';
+  import { mediaCapabilitiesManager } from '$lib/managers/media-capabilities-manager.svelte';
 
   interface Props {
     asset: AssetResponseDto;
@@ -116,6 +117,7 @@
         errorRetry: { maxNumRetry: 3, retryDelayMs: 1000, maxRetryDelayMs: 8000 },
       },
     },
+    useMediaCapabilities: false,
   };
 
   const releaseSession = () => {
@@ -138,24 +140,36 @@
       return;
     }
 
-    api.on(Hls.Events.MANIFEST_PARSED, () => {
+    api.on(Hls.Events.MANIFEST_PARSED, async () => {
+      // Defer hls.js's first fragment load until we filter out suboptimal variants
+      api.stopLoad();
       const id = api.levels[0]?.url[0]?.match(SESSION_ID_REGEX)?.[1];
       if (id) {
         activeSession = { assetId, id };
       }
-    });
 
-    // Once ABR has picked an initial codec tier, drop the others.
-    // The player already avoids switching codecs, and removing the other codecs
-    // makes the quality selector cleaner with only resolution options.
-    api.once(Hls.Events.LEVEL_SWITCHED, (_event, data) => {
-      const chosenLevel = api.levels[data.level];
-      for (let idx = api.levels.length - 1; idx >= 0; idx--) {
-        const { codecSet, videoRange } = api.levels[idx];
-        if (codecSet !== chosenLevel.codecSet || videoRange !== chosenLevel.videoRange) {
-          api.removeLevel(idx);
+      const decodingInfo = await Promise.all(api.levels.map((level) => mediaCapabilitiesManager.decodingInfo(level)));
+      const lowestBitrateByHeight = new Map<number, number>();
+      for (let i = 0; i < api.levels.length; i++) {
+        if (!decodingInfo[i].powerEfficient) {
+          continue;
+        }
+
+        const { bitrate, height } = api.levels[i];
+        const cur = lowestBitrateByHeight.get(height);
+        if (cur === undefined || bitrate < api.levels[cur].bitrate) {
+          lowestBitrateByHeight.set(height, i);
         }
       }
+
+      const keep = new Set(lowestBitrateByHeight.values());
+      for (let i = api.levels.length - 1; i >= 0; i--) {
+        if (!keep.has(i)) {
+          api.removeLevel(i);
+        }
+      }
+
+      api.startLoad(resumeTime);
     });
 
     api.on(Hls.Events.FRAG_LOADED, () => (rebuildCount = 0));
@@ -174,17 +188,10 @@
       }
       activeSession = undefined;
       resumeTime = el.currentTime;
-      // Re-setting src triggers attributeChangedCallback → load(), which
-      // destroys the old Hls and instantiates a new one with our config.
-      const url = el.src;
-      el.removeAttribute('src');
-      el.setAttribute('src', url);
+      el.load();
+      // wireHlsListeners must run after el.api is repopulated.
       queueMicrotask(() => wireHlsListeners(el, assetId, resumeTime));
     });
-
-    if (resumeTime) {
-      el.addEventListener('loadedmetadata', () => (el.currentTime = resumeTime!), { once: true });
-    }
   };
 
   onMount(() => {
