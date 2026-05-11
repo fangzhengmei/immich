@@ -72,18 +72,19 @@ Immich 采用多进程架构，通过独立的 Worker 进程实现任务的生�
 
 ### 2.4 StorageTemplateMigration vs Migration 队列职责对比
 
-两个队列名称相似，但职责完全不同：
+两个队列名称相似，但职责完全不同，边界清晰：
 
 | 维度 | `StorageTemplateMigration` 队列 | `Migration` 队列 |
 |-----|--------------------------------|-----------------|
 | **并发模式** | 串行（固定 1） | 并发（默认 5） |
 | **核心职责** | 按用户配置的模板重命名/移动**原始文件**在库目录的位置 | 迁移**衍生文件**（缩略图、预览图、编码视频、人脸图等）到新目录结构 |
-| **触发时机** | 1. 新资产上传后自动触发<br>2. 用户修改存储模板后批量触发 | 系统升级、目录结构变更时批量触发 |
-| **典型任务** | `StorageTemplateMigrationSingle`（单资产）<br>`StorageTemplateMigration`（全量） | `AssetFileMigration`（资产衍生文件）<br>`PersonFileMigration`（人脸缩略图）<br>`FileMigrationQueueAll`（批量触发） |
-| **迁移对象** | 原始照片/视频文件（library 目录） | 缩略图、预览图、编码视频、人脸缩略图（thumbs、encoded-video 目录） |
-| **依赖关系** | 依赖 EXIF 元数据提取完成（拍摄时间等信息生成路径） | 不依赖元数据，仅需文件存在 |
+| **触发入口** | 1. `AssetMetadataExtracted` 事件触发单资产迁移<br>2. 管理后台手动触发全量迁移 | 系统升级、目录结构变更时批量触发 |
+| **任务处理器** | `StorageTemplateMigrationSingle`（单资产）<br>`StorageTemplateMigration`（全量） | `AssetFileMigration`（资产衍生文件）<br>`PersonFileMigration`（人脸缩略图）<br>`FileMigrationQueueAll`（批量触发） |
+| **操作目录** | library（原始文件目录） | thumbs、encoded-video（衍生文件目录） |
+| **前置依赖** | 依赖 EXIF 元数据提取完成（拍摄时间等信息生成路径） | 不依赖元数据，仅需文件存在 |
+| **执行时机** | 每个新资产上传后立即执行 | 系统版本升级时批量执行 |
 
-### 2.4 并发配置机制
+### 2.5 并发配置机制
 
 在 `QueueService.updateConcurrency()` 中动态设置：
 
@@ -400,10 +401,12 @@ interface IEmailJob {
 
 ### 9.2 任务链依赖管理
 
-通过 `onDone` 回调实现优雅的任务间依赖：
-- 存储迁移完成 → 缩略图生成
-- 缩略图生成完成 → 并行触发多个 ML 任务
-- SmartSearch 完成（upload 来源）→ 重复检测
+通过事件驱动 + `onDone` 回调实现优雅的任务间依赖：
+- **事件驱动层**：`AssetMetadataExtracted` 事件 → 触发 `StorageTemplateMigrationSingle`
+- **onDone 回调层**：
+  - `StorageTemplateMigrationSingle` 完成（source: upload/copy）→ 触发 `AssetGenerateThumbnails`
+  - `AssetGenerateThumbnails` 完成 → 并行触发多个 ML 任务
+  - `SmartSearch` 完成（upload 来源）→ 触发 `AssetDetectDuplicates`
 
 ### 9.3 幂等性保证
 
