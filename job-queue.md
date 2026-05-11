@@ -51,7 +51,7 @@ Immich 采用多进程架构，通过独立的 Worker 进程实现任务的生�
 | `Search` | 5 | 搜索索引相关任务 | 轻量 |
 | `Sidecar` | 5 | XMP Sidecar 文件读写 | IO 密集 |
 | `Library` | 5 | 库扫描、文件同步 | IO 密集 |
-| `Migration` | 5 | 数据迁移、存储模板迁移 | IO 密集 |
+| `Migration` | 5 | 衍生文件迁移（缩略图、预览图、编码视频、人脸图等） | IO 密集 |
 | `ThumbnailGeneration` | 3 | 缩略图生成、图片处理 | CPU 密集 |
 | `VideoConversion` | 1 | 视频转码、编码 | 重度 CPU/GPU 密集 |
 | `Notification` | 5 | 邮件发送、相册通知 | IO 密集 |
@@ -212,16 +212,30 @@ POST /api/assets
     ↓
 AssetMediaService.handleUpload()
     ↓
-StorageTemplateMigrationSingle 入队
-    └── 队列: StorageTemplateMigration（串行）
+AssetExtractMetadata 入队
+    └── 队列: MetadataExtraction（并发: 5）
+    └── data: { id: asset.id, source: 'upload' }
     ↓
 任务写入 Redis
 ───────────────────────────────────────── 进程边界
     ↓  [Microservices 进程]
-Worker 消费任务，执行存储迁移
-    ↓  [source: upload/copy 才继续]
-JobService.onDone() 触发后续任务
+Worker 消费任务，执行 EXIF 元数据提取
     ↓
+元数据提取完成
+    ↓
+emit AssetMetadataExtracted 事件
+    ├─────────────────────────────────────────────────────┐
+    ↓                                                     ↓
+StorageTemplateService.onAssetMetadataExtracted()    NotificationService.onAssetMetadataExtracted()
+    ↓                                                     ↓
+StorageTemplateMigrationSingle 入队                      通知相关逻辑
+    └── 队列: StorageTemplateMigration（串行）
+    └── data: { source, id: assetId }
+    ↓
+Worker 消费任务，执行存储模板迁移（重命名/移动原始文件）
+    ↓
+JobService.onDone() 检测到任务完成
+    ↓  [source: upload/copy 才继续]
 AssetGenerateThumbnails 入队
     └── 队列: ThumbnailGeneration（并发: 3）
 ```
@@ -253,9 +267,15 @@ case JobName.AssetGenerateThumbnails: {
 ```
 照片上传 (API 进程)
     ↓
-存储模板迁移 (StorageTemplateMigrationSingle)
+AssetExtractMetadata 入队  ──  MetadataExtraction 队列 (并发: 5)
+    ↓  [Microservices 进程消费]
+元数据提取完成
+    ↓
+AssetMetadataExtracted 事件
+    ↓
+StorageTemplateMigrationSingle 入队  ──  StorageTemplateMigration 队列 (串行)
     ↓  [source: upload/copy 才继续]
-缩略图生成 (AssetGenerateThumbnails)  ──  ThumbnailGeneration 队列 (并发: 3)
+AssetGenerateThumbnails 入队  ──  ThumbnailGeneration 队列 (并发: 3)
     ├─────────────────────────────────┬─────────────────────────┐
     ↓                                 ↓                         ↓
 SmartSearch                     AssetDetectFaces          Ocr
