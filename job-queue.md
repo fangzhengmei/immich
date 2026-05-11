@@ -66,9 +66,22 @@ Immich 采用多进程架构，通过独立的 Worker 进程实现任务的生�
 | 队列名称 | 串行原因 | 典型任务 |
 |---------|---------|---------|
 | `FacialRecognition` | 人脸聚类需要顺序处理，避免同一人物同时被多个任务修改导致数据不一致 | 人脸聚类、人物合并 |
-| `StorageTemplateMigration` | 涉及文件系统移动操作，避免冲突 | 存储路径模板批量迁移 |
+| `StorageTemplateMigration` | 涉及文件系统移动操作，避免冲突 | **单资产存储模板迁移**、**全量存储模板迁移** |
 | `DuplicateDetection` | 重复检测需要全局一致性，且资源消耗大 | 批量重复照片检测 |
 | `BackupDatabase` | 数据库备份需要独占资源 | 全量数据库备份 |
+
+### 2.4 StorageTemplateMigration vs Migration 队列职责对比
+
+两个队列名称相似，但职责完全不同：
+
+| 维度 | `StorageTemplateMigration` 队列 | `Migration` 队列 |
+|-----|--------------------------------|-----------------|
+| **并发模式** | 串行（固定 1） | 并发（默认 5） |
+| **核心职责** | 按用户配置的模板重命名/移动**原始文件**在库目录的位置 | 迁移**衍生文件**（缩略图、预览图、编码视频、人脸图等）到新目录结构 |
+| **触发时机** | 1. 新资产上传后自动触发<br>2. 用户修改存储模板后批量触发 | 系统升级、目录结构变更时批量触发 |
+| **典型任务** | `StorageTemplateMigrationSingle`（单资产）<br>`StorageTemplateMigration`（全量） | `AssetFileMigration`（资产衍生文件）<br>`PersonFileMigration`（人脸缩略图）<br>`FileMigrationQueueAll`（批量触发） |
+| **迁移对象** | 原始照片/视频文件（library 目录） | 缩略图、预览图、编码视频、人脸缩略图（thumbs、encoded-video 目录） |
+| **依赖关系** | 依赖 EXIF 元数据提取完成（拍摄时间等信息生成路径） | 不依赖元数据，仅需文件存在 |
 
 ### 2.4 并发配置机制
 
