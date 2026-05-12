@@ -121,7 +121,7 @@ create({ ownerId, faceAssetId }) → 关联特征脸
 - 新Person的 `birthDate` 作为后续向量搜索的过滤条件
 - `faceAssetId` 指向的人脸embedding成为该Person的"锚点向量"
 
-### 3.2 重命名 Person
+### 3.2 Person 字段更新的影响差异
 
 **入口**：`PUT /people/:id` + `PersonUpdate` 权限
 
@@ -129,14 +129,42 @@ create({ ownerId, faceAssetId }) → 关联特征脸
 update(id, { name, birthDate, isHidden, featureFaceAssetId, isFavorite, color })
 ```
 
-**重命名与聚类联动**：
-1. **`birthDate` 更新** → 直接影响 `minBirthDate` 过滤逻辑
-   - 若Person生日从2000年改为1990年 → 搜索范围扩大10年
-   - 后续同人人脸更可能匹配到该Person
+**各字段对聚类结果的影响差异对照表**：
 
-2. **`featureFaceAssetId` 更新** → 更换"锚点人脸"
-   - Person用于相似度排序的基准向量随之改变
-   - 影响 `closestPersonId` 搜索的结果顺序
+| 字段 | 对聚类的实际影响 | 作用机制 | 是否影响自动匹配 |
+|------|-----------------|---------|-----------------|
+| **`name`** | **无直接影响** | 仅用于UI显示，不参与任何向量搜索或匹配逻辑 | ❌ |
+| **`birthDate`** | **影响显著** | 作为 `minBirthDate` 过滤条件传入 `searchFaces` | ✅ |
+| **`featureFaceAssetId`** | **仅影响排序** | 改变 Person 列表按相似度排序的基准向量 | ⚠️ |
+| **`isHidden`** | **影响范围** | 隐藏的 Person 不会出现在 getAll 结果中，但仍可被匹配 | ⚠️ |
+| **`isFavorite`** | **无直接影响** | 仅用于UI排序，不参与匹配逻辑 | ❌ |
+| **`color`** | **无直接影响** | 仅用于UI显示 | ❌ |
+
+---
+
+**详细联动机制**：
+
+1. **`birthDate` 更新** → 直接改变匹配可能性
+   - **过滤逻辑**（`search.repository.ts:337-341`）：
+     ```sql
+     WHERE (person.birthDate IS NULL OR person.birthDate <= minBirthDate)
+     ```
+   - 示例：Person生日从 2000年 → 1990年
+     - 搜索范围扩大了10年
+     - 1995年拍摄的同人人脸现在可以匹配到该Person
+     - 之前因出生太晚被过滤掉的人脸现在可能匹配成功
+
+2. **`featureFaceAssetId` 更新** → 仅影响相似度排序
+   - **Person列表排序**（`person.repository.ts:175-190`）：
+     - `closestPersonId` 参数传入时，会用该 Person 的 faceAssetId 对应的 embedding 作为基准
+     - 其他 Person 按 embedding 余弦距离排序
+   - **不影响自动匹配**：
+     - 人脸自动聚类的 `searchFaces` 调用不使用 faceAssetId
+     - 只是改变 "这个人像谁" 的展示顺序
+
+3. **`name` 更新** → 纯UI变化
+   - 只在用户手动合并、重分配人脸时帮助识别
+   - 向量搜索和聚类完全不参与
 
 ### 3.3 合并 Person
 
