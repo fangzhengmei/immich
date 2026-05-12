@@ -65,24 +65,24 @@ WITH (m = 16, ef_construction = 300);
 
 ### 2.2 两次搜索策略
 
-**第一次搜索（第489-495行）**：
+**第一次搜索**：
 ```typescript
 searchFaces({
   userIds: [ownerId],
   embedding: faceEmbedding,
   maxDistance: config.maxDistance,
-  numResults: config.minFaces,  // = minFaces
+  numResults: config.minFaces,
   minBirthDate: assetCreatedAt,
 })
 ```
 **目的**：判断是否为"核心脸"，即该人脸在库中已有足够多的相似样本
 
-**第二次搜索（第516-528行）**：
+**第二次搜索**：
 ```typescript
 searchFaces({
   ...,
   numResults: 1,
-  hasPerson: true,  // 只搜索已分配Person的人脸
+  hasPerson: true,
 })
 ```
 **目的**：寻找最近的已有Person，避免创建重复Person
@@ -91,8 +91,8 @@ searchFaces({
 
 | 条件 | 说明 |
 |------|------|
-| `matches >= minFaces` | 相似人脸数达到阈值（默认值通常为2-3） |
-| `visibility = Timeline` | 资产在时间线中可见（非归档/隐藏） |
+| `matches >= minFaces` | 相似人脸数达到阈值 |
+| `visibility = Timeline` | 资产在时间线中可见 |
 | `deferred = false` | 首次处理 → 延迟；延迟后处理 → 强制匹配 |
 
 **延迟处理机制**：
@@ -112,7 +112,7 @@ searchFaces({
 // 手动创建空Person
 create({ ownerId, name, birthDate, isHidden, isFavorite, color })
 
-// 聚类自动创建Person（第530-535行）
+// 聚类自动创建Person
 create({ ownerId, faceAssetId }) → 关联特征脸
 → 触发 PersonGenerateThumbnail 任务
 ```
@@ -145,47 +145,28 @@ update(id, { name, birthDate, isHidden, featureFaceAssetId, isFavorite, color })
 **详细联动机制**：
 
 1. **`birthDate` 更新** → 直接改变匹配可能性
-   - **过滤逻辑**（`search.repository.ts:337-341`）：
+   - **过滤逻辑**：
      ```sql
      WHERE (person.birthDate IS NULL OR person.birthDate <= minBirthDate)
      ```
    - 示例：Person生日从 2000年 → 1990年
      - 搜索范围扩大了10年
      - 1995年拍摄的同人人脸现在可以匹配到该Person
-     - 之前因出生太晚被过滤掉的人脸现在可能匹配成功
 
 2. **`featureFaceAssetId` 更新** → 仅影响相似度排序
-   - **Person列表排序**（`person.repository.ts:175-190`）：
-     - `closestPersonId` 参数传入时，会用该 Person 的 faceAssetId 对应的 embedding 作为基准
-     - 其他 Person 按 embedding 余弦距离排序
-   - **不影响自动匹配**：
-     - 人脸自动聚类的 `searchFaces` 调用不使用 faceAssetId
-     - 只是改变 "这个人像谁" 的展示顺序
+   - 改变 "按相似度展示Person" 的排序顺序
+   - 人脸自动聚类的 `searchFaces` 调用完全不使用 faceAssetId
 
 3. **`name` 更新** → 纯UI变化
-   - 只在用户手动合并、重分配人脸时帮助识别
    - 向量搜索和聚类完全不参与
 
 ### 3.3 合并 Person
 
 **入口**：`POST /people/:id/merge` + `PersonMerge` 权限
 
-```
-合并流程:
-1. 权限检查: 目标Person需PersonUpdate权限
-2. 逐个处理待合并PersonIds:
-   ├─ 权限检查: 待合并Person需PersonMerge权限
-   ├─ 属性继承: 主Person无name/birthDate → 继承待合并的
-   ├─ reassignFaces({ oldPersonId, newPersonId })
-   │   └─ SQL: UPDATE asset_face SET personId = newPersonId
-   │      WHERE personId = oldPersonId
-   ├─ 删除待合并Person(清理thumbnail文件)
-   └─ PersonCleanup 任务确保最终清理
-```
-
 **合并后对聚类的影响**：
 - 所有被合并Person的人脸embedding现在归属于同一Person
-- 后续新人脸搜索时匹配概率显著提升（更多匹配样本）
+- 后续新人脸搜索时匹配概率显著提升
 - 减少Person碎片化，提高跨相册识别准确率
 
 ### 3.4 拆分 Person
@@ -193,37 +174,16 @@ update(id, { name, birthDate, isHidden, featureFaceAssetId, isFavorite, color })
 **拆分 = 人脸重新分配到新/其他Person**
 
 **入口1**：`PUT /people/:id/reassign` + `PersonReassign` 权限
-```typescript
-// 批量重新分配
-reassignFaces(personId, { data: [{ personId, assetId }] })
-```
-
 **入口2**：`PUT /faces/:id` + `FaceUpdate` 权限
-```typescript
-// 单个人脸重新分配
-reassignFacesById(newPersonId, { id: faceId })
-```
 
-**拆分联动逻辑（第82-125行）**：
-```
-人脸A从PersonX移到PersonY:
-1. 若PersonY之前无特征脸 → 选新移入的脸作为特征脸
-2. 若PersonX移走的是它的特征脸 → PersonX需要重新选特征脸
-3. createNewFeaturePhoto([...受影响的PersonIds])
-   └─ 选随机人脸作为新特征脸 + 生成新缩略图
-```
+**拆分联动逻辑**：
+- 接收方Person无特征脸 → 选新移入的脸作为特征脸
+- 移出方Person失去特征脸 → 随机选一张脸作为新特征脸
+- 触发 `PersonGenerateThumbnail` 任务生成新缩略图
 
 ### 3.5 删除 Person
 
 **入口**：`DELETE /people/:id` + `PersonDelete` 权限
-
-```typescript
-deleteAll(ids)
-  ├─ 检查所有权 access.person.checkOwnerAccess()
-  ├─ 删除存储的缩略图文件
-  ├─ 数据库删除person记录
-  └─ 关联人脸自动变为未分配状态(ON DELETE SET NULL)
-```
 
 **注意**：删除Person不会删除对应的人脸，这些人脸将在后续FacialRecognition任务中重新聚类
 
@@ -243,7 +203,6 @@ deleteAll(ids)
 
 **关键约束**：
 - Person是用户级隔离的，不同用户即使人脸相似也不会互相匹配
-- `userIds: [face.asset.ownerId]` 确保跨用户隔离
 
 ### 4.2 年龄一致性过滤
 
@@ -255,11 +214,6 @@ WHERE (person.birthDate IS NULL OR person.birthDate <= minBirthDate)
 
 **原理**：照片拍摄时间必定晚于人物出生日期 → 排除时空矛盾的匹配
 
-**示例**：
-- 2020年拍摄的照片A → 只能匹配 birthDate ≤ 2020年的Person
-- 2010年拍摄的照片B → 可以匹配 birthDate ≤ 2010年的Person
-- 若Person无birthDate → 不限制
-
 ### 4.3 手动人脸优先
 
 ```typescript
@@ -268,7 +222,7 @@ sourceType = SourceType.Manual | MachineLearning
 
 **Manual人脸特性**：
 - 用户手动框选/分配的人脸
-- 不参与自动聚类（第474-477行：非ML来源人脸直接跳过）
+- **不参与自动聚类**（非ML来源人脸直接跳过）
 - 作为"黄金标准"锚定Person的向量中心
 - 提高该Person后续自动匹配的准确率
 
@@ -286,7 +240,7 @@ sourceType = SourceType.Manual | MachineLearning
 
 ### 5.2 详细失败分支
 
-**handleRecognizeFaces() 失败路径（第462-543行）**：
+**handleRecognizeFaces() 失败路径**：
 ```
 1. 人脸识别未启用(config) → Skipped
 2. face不存在 / asset关联丢失 → Failed
@@ -295,31 +249,6 @@ sourceType = SourceType.Manual | MachineLearning
 5. 已有personId → Skipped (避免重复处理)
 6. matches <= 1 (minFaces > 1) → Skipped (仅匹配到自己)
 7. 非核心脸 + 非延迟处理 → 重新入队(deferred=true) → Skipped
-```
-
-**handleDetectFaces() 失败路径（第302-384行）**：
-```
-1. 人脸识别未启用 → Skipped
-2. 资产文件丢失(previewPath) → Failed
-3. 资产visibility = Hidden → Skipped
-4. ML服务调用失败(网络/模型错误) → 抛出异常 → Failed
-```
-
-### 5.3 边界情况处理
-
-**空Person清理**（第262-267行）：
-```typescript
-getAllWithoutFaces() → 找出所有 face_count = 0 的Person
-  → 删除文件 + 数据库删除
-```
-**触发时机**：每次全量人脸检测完成后自动入队
-
-**Person特征脸丢失**：
-```typescript
-// 当Person的faceAssetId指向的人脸被删除/移动时
-createNewFeaturePhoto(personId)
-  → getRandomFace(personId) 选一个随机脸作为新特征脸
-  → 触发 PersonGenerateThumbnail 任务
 ```
 
 ---
@@ -346,23 +275,6 @@ createNewFeaturePhoto(personId)
 | `FaceUpdate` | 重新分配人脸 | 等价PersonReassign |
 | `FaceDelete` | 删除人脸 | soft delete / force delete |
 
-### 6.3 权限检查实现
-
-```typescript
-// access.ts 第287-300行
-case Permission.PersonCreate:
-case Permission.PersonReassign:
-  return access.person.checkFaceOwnerAccess(userId, faceIds);
-
-case Permission.PersonRead | PersonUpdate | PersonDelete | PersonMerge:
-  return access.person.checkOwnerAccess(userId, personIds);
-```
-
-**关键设计**：
-- Person操作检查Person所有权
-- 人脸分配操作检查人脸所在资产的所有权
-- 确保用户只能操作自己的人脸和Person
-
 ---
 
 ## 七、核心数据表关系
@@ -382,9 +294,6 @@ case Permission.PersonRead | PersonUpdate | PersonDelete | PersonMerge:
 │ color        │  │      │ isVisible    ││
 └──────────────┘  │      └──────────────┘│
                   └──────────────────────┘
-                      1:N 关系
-                   一个Person有多张脸
-                   一张脸属于0或1个Person
 ```
 
 ---
@@ -400,11 +309,6 @@ case Permission.PersonRead | PersonUpdate | PersonDelete | PersonMerge:
 }
 ```
 
-**配置对聚类的影响**：
-- `minFaces` 越大 → 创建Person越保守 → Person越少但更准确
-- `maxDistance` 越小 → 匹配越严格 → Person越多但错误率低
-- 两者需要根据数据集大小和准确率要求平衡调整
-
 ---
 
 ## 九、Deferred 重试与 PersonCleanup 触发时机
@@ -412,18 +316,18 @@ case Permission.PersonRead | PersonUpdate | PersonDelete | PersonMerge:
 ### 9.1 完整时间线与先后关系
 
 ```
-时间轴 (正常完整流程：
+时间轴:
 
 T0  资产上传 → AssetDetectFacesQueueAll 入队
     ↓
 T1  handleQueueDetectFaces() 执行
     ├─ 遍历所有未检测人脸的资产
     ├─ 批量入队 AssetDetectFaces 任务
-    └─ 所有资产检测完成后 → PersonCleanup 入队 (force===undefined时)
+    └─ 所有资产检测完成后 → PersonCleanup 入队
     ↓
 T2  各 AssetDetectFaces 并行执行 → 生成人脸+embedding
     ↓
-T3  FacialRecognitionQueueAll 入队 (手动触发/定时任务
+T3  FacialRecognitionQueueAll 入队
     ↓
 T4  handleQueueRecognizeFaces() 执行
     ├─ 等待 FaceDetection 队列完成
@@ -433,18 +337,10 @@ T4  handleQueueRecognizeFaces() 执行
 T5  handleRecognizeFaces(deferred: false) 执行
     ├─ 是核心脸？
     │  ├─ 是 → 分配/创建Person → Success
-    │  └─ 否 → 重新入队 FacialRecognition(id, deferred: true) → Skipped
+    │  └─ 否 → 重新入队 deferred=true → Skipped
     ↓
-T6  handleRecognizeFaces(deferred: true) 执行 (队列中的 deferred=true
+T6  handleRecognizeFaces(deferred: true) 执行
     └─ 无论是否核心脸 → 强制尝试匹配
-    └─ 有匹配Person → 分配 → Success
-    └─ 无匹配 → 仍保留未分配状态 → ???
-    ↓
-T7  (下一次 FacialRecognitionQueueAll (nightly定时任务)
-    └─ 再次遍历所有 personId=null 的人脸 → 重试匹配
-    ↓
-T8  (手动触发重新检测) → PersonCleanup 执行
-    └─ 删除所有 face_count=0 的空Person
 ```
 
 ---
@@ -452,14 +348,14 @@ T8  (手动触发重新检测) → PersonCleanup 执行
 ### 9.2 Deferred 重试机制详解
 
 | 阶段 | deferred 值 | 触发条件 | 队列入口 | 返回状态 | 对Person归属的影响 |
-|------|---------|---------|---------|---------|-------------------|
-| **首次处理** | `false` | `handleQueueRecognizeFaces 批量入队 | `personId=null 的所有ML人脸 | **Skipped** (非核心脸时重新入队 | 不分配，等待更多样本 |
-| **延迟重试** | `true` | 非核心脸首次处理后重新入队 | 自身 handleRecognizeFaces 触发 | **Success/Skipped | 强制匹配，可能分配也可能找不到匹配 |
+|------|---------|---------|---------|---------|
+| **首次处理** | `false` | 批量入队所有未分配人脸 | `FacialRecognition` 队列 | **Skipped** 非核心脸时重新入队 | 不分配，等待更多样本积累 |
+| **延迟重试** | `true` | 非核心脸首次处理后重新入队 | `FacialRecognition` 队列 | **Success/Skipped** | 强制匹配，可能分配也可能找不到匹配 |
 
-**关键代码**：
-- deferred=false 时，非核心脸 → "等等看，需要更多相似人脸积累后再匹配
+**关键代码说明**：
+- deferred=false 时，非核心脸 → "等等看"，需要更多相似人脸积累后再匹配
 - deferred=true 时，强制匹配 → 不等待，即使只有1张人脸也尝试匹配现有Person
-- deferred 仅重试只有1次 → 不是无限循环重试失败后不会再自动入队
+- deferred 仅重试 **1次** → 不是无限循环，失败后不会再自动入队
 
 ---
 
@@ -467,10 +363,10 @@ T8  (手动触发重新检测) → PersonCleanup 执行
 
 | 触发场景 | 触发位置 | 执行条件 |
 |---------|---------|---------|
-| **全量检测后** | `handleQueueDetectFaces:295-297` | `force === undefined` (非强制模式) |
-| **强制检测前** | `handleQueueDetectFaces:278` | `force = true` 先清空旧人脸后清理 |
-| **强制识别前** | `handleQueueRecognizeFaces:428` | `force = true` 先清空所有旧分配后清理 |
-| **手动API触发 | API `/api/job/PersonCleanup 任务 | 手动调用 job API |
+| **全量检测后** | `handleQueueDetectFaces` 末尾 | 非强制模式下自动触发 |
+| **强制检测前** | `handleQueueDetectFaces` 开头 | force = true 先清空旧人脸后清理 |
+| **强制识别前** | `handleQueueRecognizeFaces` 开头 | force = true 先清空所有旧分配后清理 |
+| **手动API触发** | API `/api/job` | 手动调用 job API |
 
 ---
 
@@ -479,20 +375,18 @@ T8  (手动触发重新检测) → PersonCleanup 执行
 ```
 执行顺序优先级：
 
-1. FaceDetection 队列 (人脸检测 → 生成新人脸
+1. FaceDetection 队列 (人脸检测 → 生成新人脸)
 2. PersonCleanup 入队 (但不等待 FaceDetection 全部完成)
    ↓
-3. FacialRecognition 队列 (人脸聚类 → 分配Person
+3. FacialRecognition 队列 (人脸聚类 → 分配Person)
    ├─ deferred=false 首次处理
    │  └─ 非核心脸 → deferred=true 入队
    └─ deferred=true 延迟处理
-
-关键：PersonCleanup 在 FaceDetection 完成后立即入队，但不会等待后续 FacialRecognition 完成
 ```
 
 **竞态条件说明**：
-- PersonCleanup 只删除的是当前已经 face_count=0 的 Person
-- 正在 FacialRecognition 中正在分配的人脸不会被删除（有数据库事务一致性保证
+- PersonCleanup 只删除当前已经 face_count=0 的Person
+- 正在 FacialRecognition 中正在分配的人脸不会被删除（有数据库事务一致性保证）
 
 ---
 
@@ -500,10 +394,10 @@ T8  (手动触发重新检测) → PersonCleanup 执行
 
 | 动作类型 | 具体操作 | 触发条件 | 进入的队列/任务入口 | 可能返回状态 | 对Person归属的实际影响 | 影响聚类结果？ |
 |---------|---------|---------|---------|---------|
-| **仅重命名name | 修改Person.name字段 | 用户调用 `PUT /people/:id` | 无队列（同步执行） | Success | ❌ name仅UI显示，完全不参与任何向量匹配或聚类逻辑 | ❌ 不改变 |
+| **仅重命名name** | 修改Person.name字段 | 用户调用 `PUT /people/:id` | 无队列（同步执行） | Success | ❌ name仅UI显示，完全不参与任何向量匹配或聚类逻辑 | ❌ 不改变 |
 | **修改birthDate** | 修改Person.birthDate字段 | 用户调用 `PUT /people/:id` | 无队列（同步执行） | Success | ✅ birthDate作为 `minBirthDate` 过滤条件直接传入 `searchFaces` SQL，扩大/缩小可匹配的时间范围 | ✅ 直接改变 |
 | **修改featureFaceAssetId** | 更新Person.faceAssetId | 用户调用 `PUT /people/:id` | `PersonGenerateThumbnail` 缩略图生成队列 | Success | ⚠️ 仅改变Person列表按相似度排序的基准向量，影响closestPersonId搜索的展示顺序，自动聚类完全不使用 | ⚠️ 仅影响排序展示 |
-| **非核心脸deferred=false** | 首次聚类处理 | `matches < minFaces` 或 `asset.visibility != Timeline | `FacialRecognition` 队列 | Skipped | 🔄 不分配Person，重新入队 deferred=true 延迟重试，等待更多相似人脸积累 | 🔄 延迟待定 |
+| **非核心脸deferred=false** | 首次聚类处理 | `matches < minFaces` 或 `asset.visibility != Timeline` | `FacialRecognition` 队列 | Skipped | 🔄 不分配Person，重新入队 deferred=true 延迟重试，等待更多相似人脸积累 | 🔄 延迟待定 |
 | **非核心脸deferred=true** | 延迟后强制重试 | 自身触发重新入队 | `FacialRecognition` 队列 | Success / Skipped | ✅ 强制匹配现有Person，成功则分配，失败则保持未分配状态（仅重试1次） | ✅ 可能改变 |
 | **PersonCleanup清理** | 删除空Person | 全量人脸检测完成后 | `PersonCleanup` 背景任务队列 | Success | 🗑️ 仅删除 `face_count=0` 的空Person（无任何人脸关联的孤立Person），不影响已有分配关系 | ❌ 仅清理，不改变 |
 
@@ -529,9 +423,15 @@ T8  (手动触发重新检测) → PersonCleanup 执行
 
 ## 十一、扩展常见误区对照表
 
+| 动作/场景 | 误区认知 | 实际行为 | 触发条件 | 队列入口 | 返回状态 | 对Person归属实际影响 |
+|---------|---------|---------|---------|---------|
+| **删除Person** | Person删除后人脸也一起删除 | Person删除后关联人脸personId置空，**人脸保留**，下次聚类重新匹配 | `DELETE /people/:id` | 无队列(同步执行) | - | 🔄 人脸在下轮聚类重新分配 |
+| **手动分配人脸** | 手动分配的人脸会被聚类算法重新分配 | `sourceType=Manual` 的人脸**永不参与自动聚类** | `PUT /faces/:id` | 无队列(同步执行) | Success | ✅ 永久锁定归属，不会被ML算法重新分配 |
+| **合并Person** | 合并的Person人脸会被重新聚类 | 合并后所有脸personId直接更新，**不会重新计算** | `POST /people/:id/merge` | 无队列(同步执行) | Success | ✅ 批量人脸永久归属 |
+
 ---
 
-## 十一、代码路径索引
+## 十二、代码路径索引
 
 | 模块 | 文件路径 | 核心函数 |
 |------|---------|---------|
