@@ -79,13 +79,16 @@ enum AlbumUserRole {
 
 ### 2.1 认证流程总览
 
-认证守卫（`AuthGuard`）在请求进入时触发，通过 `AuthService.authenticate()` 方法完成验证：
+认证守卫（`AuthGuard`）在请求进入时触发，通过 `AuthService.authenticate()` 方法完成验证，**链接过期校验在认证层完成**：
 
 ```
 请求进入 → AuthGuard.canActivate() 
          → AuthService.authenticate()
          → 解析请求头/查询参数中的认证信息
          → 按优先级验证：shareKey → shareSlug → session → apiKey
+            ↓ （认证层校验过期时间）
+         → validateSharedLinkKey() / validateSharedLinkSlug()
+         → 检查 expiresAt 是否已过期
          → 构建 AuthDto 对象
 ```
 
@@ -95,7 +98,7 @@ enum AlbumUserRole {
 1. **Share Key**：通过 `key` 查询参数或 `x-immich-share-key` 请求头
 2. **Share Slug**：通过 `slug` 查询参数或 `x-immich-share-slug` 请求头（自定义别名）
 
-#### 核心验证代码（`auth.service.ts:validateSharedLinkKey`）：
+#### 核心验证代码（`auth.service.ts:validate`）：
 
 ```typescript
 async validate({ headers, queryParams }): Promise<AuthDto> {
@@ -105,9 +108,11 @@ async validate({ headers, queryParams }): Promise<AuthDto> {
                     queryParams[ImmichQuery.SharedLinkSlug];
   
   if (shareKey) {
+    // 认证层：调用仓库查询，校验链接是否存在、是否过期
     return this.validateSharedLinkKey(shareKey);
   }
   if (shareSlug) {
+    // 认证层：调用仓库查询，校验链接是否存在、是否过期
     return this.validateSharedLinkSlug(shareSlug);
   }
   // ...其他认证方式
@@ -180,18 +185,52 @@ return respondWithCookie(res, sharedLink, {
 ```
 请求权限
     ↓
-checkAccess()
+checkAccess() 【统一权限入口】
     ├─ 是共享链接访问？ → checkSharedLinkAccess()
+    │   ├─ 公开链接：按链接配置裁剪
+    │   └─ 密码链接：验证Cookie Token后按链接配置裁剪
     └─ 是普通用户访问？ → checkOtherAccess()
+        └─ 同事相册共享：按角色和加入的相册裁剪
               ↓
          过滤允许访问的资源ID集合
               ↓
          返回裁剪后的结果
 ```
 
-### 3.2 共享链接访问控制矩阵
+### 3.2 三条访问路径的范围裁剪对照
 
-共享链接的访问控制严格根据链接配置裁剪访问范围（`access.ts:checkSharedLinkAccess`）：
+| 裁剪维度 | 同事相册共享（普通用户路径） | 带密码分享链接（共享链接路径） | 公开分享链接（共享链接路径） |
+|---------|---------------------------|---------------------------|--------------------------|
+| **统一入口** | `checkOtherAccess()` | `checkSharedLinkAccess()` | `checkSharedLinkAccess()` |
+| **身份验证** | Session/API Key 登录认证 | ① shareKey 密钥认证 + ② Cookie Token 密码验证 | 仅 shareKey 密钥认证 |
+| **AssetRead 裁剪** | 所有者资产 ∪ 加入相册资产 ∪ 伴侣共享资产 | 共享链接关联资产（需在有效期内） | 共享链接关联资产（需在有效期内） |
+| **AssetDownload 裁剪** | 同上三者取并集 | `allowDownload=true ? 共享关联资产 : ∅` | `allowDownload=true ? 共享关联资产 : ∅` |
+| **AssetUpload 裁剪** | 仅用户自己的存储空间 | `allowUpload=true ? 允许上传 : 拒绝` | `allowUpload=true ? 允许上传 : 拒绝` |
+| **AlbumRead 裁剪** | 自己创建的相册 ∪ 已加入的共享相册 | 共享链接关联的相册 | 共享链接关联的相册 |
+| **AlbumAssetCreate 裁剪** | Owner/Editor 角色可添加 | `allowUpload=true ? 允许添加 : 拒绝` | `allowUpload=true ? 允许添加 : 拒绝` |
+| **EXIF元数据** | 完整可见 | `showExif=true ? 可见 : 脱敏` | `showExif=true ? 可见 : 脱敏` |
+| **其他操作权限** | 按用户权限完整开放 | 全部拒绝 | 全部拒绝 |
+
+### 3.3 共享链接访问控制矩阵
+
+公开链接和密码链接共用此控制逻辑，密码链接需要额外验证 Cookie Token：
+
+```typescript
+// shared-link.service.ts:getMine - 密码链接Token校验
+async getMine(auth: AuthDto, authTokens: string[]) {
+  const sharedLink = await this.findOrFail(auth.user.id, auth.sharedLink.id);
+  const { id, password } = sharedLink;
+  
+  // 密码链接必须验证 Cookie 中的 Token
+  if (password && !authTokens.includes(this.asToken({ id, password }))) {
+    throw new UnauthorizedException('Password required');
+  }
+  
+  return mapSharedLink(sharedLink, { stripAssetMetadata: !sharedLink.showExif });
+}
+```
+
+核心权限裁剪逻辑（`access.ts:checkSharedLinkAccess`）：
 
 ```typescript
 const checkSharedLinkAccess = async (request: SharedLinkAccessRequest) => {
@@ -236,7 +275,49 @@ const checkSharedLinkAccess = async (request: SharedLinkAccessRequest) => {
 };
 ```
 
-### 3.3 共享资产边界验证
+### 3.4 同事相册共享访问控制
+
+同事加入相册场景的权限裁剪逻辑（`access.ts:checkOtherAccess`）：
+
+```typescript
+const checkOtherAccess = async (access: AccessRepository, request: OtherAccessRequest) => {
+  const { auth, permission, ids } = request;
+
+  switch (permission) {
+    case Permission.AssetRead: {
+      // 三重范围叠加：自己的资产 + 加入相册的资产 + 伴侣共享资产
+      const isOwner = await access.asset.checkOwnerAccess(auth.user.id, ids, auth.session?.hasElevatedPermission);
+      const isAlbum = await access.asset.checkAlbumAccess(auth.user.id, setDifference(ids, isOwner));
+      const isPartner = await access.asset.checkPartnerAccess(auth.user.id, setDifference(ids, isOwner, isAlbum));
+      return setUnion(isOwner, isAlbum, isPartner);
+    }
+    
+    case Permission.AlbumRead: {
+      // 双重范围叠加：自己创建的相册 + 已加入的共享相册
+      const isOwner = await access.album.checkOwnerAccess(auth.user.id, ids);
+      const isShared = await access.album.checkSharedAlbumAccess(
+        auth.user.id,
+        setDifference(ids, isOwner),
+        AlbumUserRole.Viewer,
+      );
+      return setUnion(isOwner, isShared);
+    }
+    
+    case Permission.AlbumAssetCreate: {
+      // 双重范围叠加：自己创建的相册 + Editor角色相册
+      const isOwner = await access.album.checkOwnerAccess(auth.user.id, ids);
+      const isShared = await access.album.checkSharedAlbumAccess(
+        auth.user.id,
+        setDifference(ids, isOwner),
+        AlbumUserRole.Editor,
+      );
+      return setUnion(isOwner, isShared);
+    }
+  }
+};
+```
+
+### 3.5 共享资产边界验证
 
 数据库层验证资产是否在共享链接范围内（`access.repository.ts`）：
 
@@ -250,7 +331,7 @@ WHERE shared_link_asset.sharedLinkId = $1
   AND asset.deletedAt IS NULL
 ```
 
-### 3.4 元数据脱敏控制
+### 3.6 元数据脱敏控制
 
 返回共享链接资产时，根据 `showExif` 配置裁剪 EXIF 元数据：
 
@@ -261,7 +342,7 @@ return mapSharedLink(sharedLink, {
 });
 ```
 
-### 3.5 上传权限验证
+### 3.7 上传权限验证
 
 上传接口验证共享链接是否允许上传：
 
@@ -276,67 +357,15 @@ export const requireUploadAccess = (auth: AuthDto | null): AuthDto => {
 
 ---
 
-## 四、三种分享渠道的权限统一模型
+## 四、安全边界设计
 
-### 4.1 渠道权限对比
-
-| 权限维度 | 同事相册共享 | 带密码分享链接 | 公开分享链接 |
-|---------|-------------|---------------|-------------|
-| **身份认证** | 用户登录认证 | 链接密钥 + 密码验证 | 仅链接密钥 |
-| **访问控制** | AlbumUserRole 角色 | 链接配置 | 链接配置 |
-| **可访问资源** | 相册内全部资产 | 链接关联的资产/相册 | 链接关联的资产/相册 |
-| **上传权限** | 有（Editor角色） | 由 `allowUpload` 控制 | 由 `allowUpload` 控制 |
-| **下载权限** | 有 | 由 `allowDownload` 控制 | 由 `allowDownload` 控制 |
-| **EXIF可见性** | 可见 | 由 `showExif` 控制 | 由 `showExif` 控制 |
-| **有效期** | 永久（直到被移除） | 由 `expiresAt` 控制 | 由 `expiresAt` 控制 |
-
-### 4.2 统一访问控制入口
-
-三种渠道通过 `checkAccess()` 函数实现统一入口：
-
-```typescript
-export const checkAccess = async (
-  access: AccessRepository,
-  { ids, auth, permission }: AccessRequest,
-): Promise<Set<string>> => {
-  // 共享链接访问路径
-  if (auth.sharedLink) {
-    return checkSharedLinkAccess(access, { 
-      sharedLink: auth.sharedLink, 
-      permission, 
-      ids: idSet 
-    });
-  }
-  
-  // 普通用户/同事共享路径
-  return checkOtherAccess(access, { auth, permission, ids: idSet });
-};
-```
-
-### 4.3 普通用户访问控制（同事共享）
-
-对于同事加入相册的场景，通过多维度权限叠加计算可访问范围：
-
-```typescript
-case Permission.AssetRead: {
-  const isOwner = await access.asset.checkOwnerAccess(userId, ids);        // 自己的资产
-  const isAlbum = await access.asset.checkAlbumAccess(userId, diff1);      // 加入的相册资产
-  const isPartner = await access.asset.checkPartnerAccess(userId, diff2);  // 伴侣共享资产
-  return setUnion(isOwner, isAlbum, isPartner);  // 三者取并集
-}
-```
-
----
-
-## 五、安全边界设计
-
-### 5.1 密钥安全性
+### 4.1 密钥安全性
 
 - `key` 字段使用 50 字节随机 Buffer，经 Base64URL 编码，熵充足
 - 密码保护链接需同时持有 **链接密钥** + **访问密码** 双重认证
 - 密码验证采用直接字符串比对（密码存储在数据库中，非哈希）
 
-### 5.2 路由隔离
+### 4.2 路由隔离
 
 ```typescript
 // 共享链接只能访问标记为 sharedLink: true 的路由
@@ -345,11 +374,11 @@ if (authDto.sharedLink && !sharedLinkRoute) {
 }
 ```
 
-### 5.3 过期时间检查
+### 4.3 过期时间检查
 
-在 `getByKey` / `getBySlug` 查询时自动检查 `expiresAt` 字段，过期链接拒绝访问。
+**在认证层校验**：`validateSharedLinkKey` / `validateSharedLinkSlug` 调用仓库查询获取链接信息后，检查 `expiresAt` 字段，过期链接直接拒绝访问。
 
-### 5.4 API Key 权限检查
+### 4.4 API Key 权限检查
 
 ```typescript
 if (authDto.apiKey && requestedPermission !== false) {
@@ -361,15 +390,16 @@ if (authDto.apiKey && requestedPermission !== false) {
 
 ---
 
-## 六、架构总结
+## 五、架构总结
 
 ### 核心设计思想
 
 1. **统一模型**：三种分享渠道共用 `checkAccess` 权限框架，避免重复逻辑
-2. **范围裁剪**：返回**允许访问的资源ID集合**，而非布尔值，支持细粒度过滤
-3. **配置驱动**：共享链接行为完全由字段配置驱动（`allowUpload`/`allowDownload`/`showExif`）
-4. **最小权限**：共享链接默认仅开放读取类权限，其他权限需显式开启
-5. **分层验证**：认证层 → 权限层 → 资源边界层，三层防护确保安全
+2. **路径分支**：统一入口内部分发至 `checkSharedLinkAccess` / `checkOtherAccess` 两条路径
+3. **范围裁剪**：返回**允许访问的资源ID集合**，而非布尔值，支持细粒度过滤
+4. **配置驱动**：共享链接行为完全由字段配置驱动（`allowUpload`/`allowDownload`/`showExif`）
+5. **最小权限**：共享链接默认仅开放读取类权限，其他权限需显式开启
+6. **分层验证**：认证层（过期校验）→ 权限层 → 资源边界层，三层防护确保安全
 
 ### 文件位置索引
 
