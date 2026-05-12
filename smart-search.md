@@ -38,7 +38,8 @@ Immich 使用 OpenCLIP 双编码器架构：
    │    └─ 重置 probes = 1
    │
    └─ 2.3 向量数据清理（当前实现）
-        └─ truncate smart_search 清空所有向量，无自动触发全量重编码（TODO）
+        └─ delete from smart_search 删除所有向量，无自动触发全量重编码（TODO）
+           真正 truncate 操作发生在 deleteAllSearchEmbeddings() 路径
            手动触发入口：JobName.SmartSearchQueueAll 任务队列
 
 3. 索引参数动态计算 (vchord 专属)
