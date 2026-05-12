@@ -407,7 +407,131 @@ case Permission.PersonRead | PersonUpdate | PersonDelete | PersonMerge:
 
 ---
 
-## 九、代码路径索引
+## 九、Deferred 重试与 PersonCleanup 触发时机
+
+### 9.1 完整时间线与先后关系
+
+```
+时间轴 (正常完整流程：
+
+T0  资产上传 → AssetDetectFacesQueueAll 入队
+    ↓
+T1  handleQueueDetectFaces() 执行
+    ├─ 遍历所有未检测人脸的资产
+    ├─ 批量入队 AssetDetectFaces 任务
+    └─ 所有资产检测完成后 → PersonCleanup 入队 (force===undefined时)
+    ↓
+T2  各 AssetDetectFaces 并行执行 → 生成人脸+embedding
+    ↓
+T3  FacialRecognitionQueueAll 入队 (手动触发/定时任务
+    ↓
+T4  handleQueueRecognizeFaces() 执行
+    ├─ 等待 FaceDetection 队列完成
+    ├─ 遍历所有 personId=null 的ML人脸
+    └─ 批量入队 FacialRecognition(id, deferred: false)
+    ↓
+T5  handleRecognizeFaces(deferred: false) 执行
+    ├─ 是核心脸？
+    │  ├─ 是 → 分配/创建Person → Success
+    │  └─ 否 → 重新入队 FacialRecognition(id, deferred: true) → Skipped
+    ↓
+T6  handleRecognizeFaces(deferred: true) 执行 (队列中的 deferred=true
+    └─ 无论是否核心脸 → 强制尝试匹配
+    └─ 有匹配Person → 分配 → Success
+    └─ 无匹配 → 仍保留未分配状态 → ???
+    ↓
+T7  (下一次 FacialRecognitionQueueAll (nightly定时任务)
+    └─ 再次遍历所有 personId=null 的人脸 → 重试匹配
+    ↓
+T8  (手动触发重新检测) → PersonCleanup 执行
+    └─ 删除所有 face_count=0 的空Person
+```
+
+---
+
+### 9.2 Deferred 重试机制详解
+
+| 阶段 | deferred 值 | 触发条件 | 队列入口 | 返回状态 | 对Person归属的影响 |
+|------|---------|---------|---------|---------|-------------------|
+| **首次处理** | `false` | `handleQueueRecognizeFaces 批量入队 | `personId=null 的所有ML人脸 | **Skipped** (非核心脸时重新入队 | 不分配，等待更多样本 |
+| **延迟重试** | `true` | 非核心脸首次处理后重新入队 | 自身 handleRecognizeFaces 触发 | **Success/Skipped | 强制匹配，可能分配也可能找不到匹配 |
+
+**关键代码**：
+- deferred=false 时，非核心脸 → "等等看，需要更多相似人脸积累后再匹配
+- deferred=true 时，强制匹配 → 不等待，即使只有1张人脸也尝试匹配现有Person
+- deferred 仅重试只有1次 → 不是无限循环重试失败后不会再自动入队
+
+---
+
+### 9.3 PersonCleanup 触发时机
+
+| 触发场景 | 触发位置 | 执行条件 |
+|---------|---------|---------|
+| **全量检测后** | `handleQueueDetectFaces:295-297` | `force === undefined` (非强制模式) |
+| **强制检测前** | `handleQueueDetectFaces:278` | `force = true` 先清空旧人脸后清理 |
+| **强制识别前** | `handleQueueRecognizeFaces:428` | `force = true` 先清空所有旧分配后清理 |
+| **手动API触发 | API `/api/job/PersonCleanup 任务 | 手动调用 job API |
+
+---
+
+### 9.4 先后关系与依赖
+
+```
+执行顺序优先级：
+
+1. FaceDetection 队列 (人脸检测 → 生成新人脸
+2. PersonCleanup 入队 (但不等待 FaceDetection 全部完成)
+   ↓
+3. FacialRecognition 队列 (人脸聚类 → 分配Person
+   ├─ deferred=false 首次处理
+   │  └─ 非核心脸 → deferred=true 入队
+   └─ deferred=true 延迟处理
+
+关键：PersonCleanup 在 FaceDetection 完成后立即入队，但不会等待后续 FacialRecognition 完成
+```
+
+**竞态条件说明**：
+- PersonCleanup 只删除的是当前已经 face_count=0 的 Person
+- 正在 FacialRecognition 中正在分配的人脸不会被删除（有数据库事务一致性保证
+
+---
+
+## 十、误区对照速查表
+
+| 动作类型 | 具体操作 | 触发条件 | 进入的队列/任务入口 | 可能返回状态 | 对Person归属的实际影响 | 影响聚类结果？ |
+|---------|---------|---------|---------|---------|
+| **仅重命名name | 修改Person.name字段 | 用户调用 `PUT /people/:id` | 无队列（同步执行） | Success | ❌ name仅UI显示，完全不参与任何向量匹配或聚类逻辑 | ❌ 不改变 |
+| **修改birthDate** | 修改Person.birthDate字段 | 用户调用 `PUT /people/:id` | 无队列（同步执行） | Success | ✅ birthDate作为 `minBirthDate` 过滤条件直接传入 `searchFaces` SQL，扩大/缩小可匹配的时间范围 | ✅ 直接改变 |
+| **修改featureFaceAssetId** | 更新Person.faceAssetId | 用户调用 `PUT /people/:id` | `PersonGenerateThumbnail` 缩略图生成队列 | Success | ⚠️ 仅改变Person列表按相似度排序的基准向量，影响closestPersonId搜索的展示顺序，自动聚类完全不使用 | ⚠️ 仅影响排序展示 |
+| **非核心脸deferred=false** | 首次聚类处理 | `matches < minFaces` 或 `asset.visibility != Timeline | `FacialRecognition` 队列 | Skipped | 🔄 不分配Person，重新入队 deferred=true 延迟重试，等待更多相似人脸积累 | 🔄 延迟待定 |
+| **非核心脸deferred=true** | 延迟后强制重试 | 自身触发重新入队 | `FacialRecognition` 队列 | Success / Skipped | ✅ 强制匹配现有Person，成功则分配，失败则保持未分配状态（仅重试1次） | ✅ 可能改变 |
+| **PersonCleanup清理** | 删除空Person | 全量人脸检测完成后 | `PersonCleanup` 背景任务队列 | Success | 🗑️ 仅删除 `face_count=0` 的空Person（无任何人脸关联的孤立Person），不影响已有分配关系 | ❌ 仅清理，不改变 |
+
+---
+
+### 10.1 核心结论
+
+**会真实改变聚类结果的动作（仅2个）**：
+1. ✅ **修改 `birthDate`** → 直接改变 `searchFaces` 的过滤范围，影响后续人脸可匹配到的Person集合
+2. ✅ **非核心脸 `deferred=true` 强制重试** → 第二次处理时跳过核心脸判定，强行分配Person
+
+**仅影响展示/排序的动作（4个）**：
+1. ❌ **仅重命名 `name`** → 纯UI展示，与向量搜索、聚类算法完全无关
+2. ⚠️ **修改 `featureFaceAssetId`** → 仅影响 "按相似度展示Person" 的排序顺序，自动聚类不使用
+3. ❌ **`deferred=false` 跳过处理** → 只是延迟，不改变最终归属，只是暂缓决定
+4. ❌ **PersonCleanup 清理** → 仅删除无用的空Person，是垃圾回收，不影响正常Person的归属关系
+
+---
+
+> **一句话总结**：别再纠结改名字、换封面是否影响人脸识别了 —— 只有改生日才真的能让你在老照片里被认出！
+
+---
+
+## 十一、扩展常见误区对照表
+
+---
+
+## 十一、代码路径索引
 
 | 模块 | 文件路径 | 核心函数 |
 |------|---------|---------|
