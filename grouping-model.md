@@ -329,7 +329,8 @@ async deleteEmptyTags() {
 // 真实实现：server/src/repositories/stack.repository.ts:63-124
 async create(entity: Omit<Insertable<StackTable>, 'primaryAssetId'>, assetIds: string[]) {
   return this.db.transaction().execute(async (tx) => {
-    // 步骤1：查找包含任一目标资产的现有 Stack
+    // 步骤1：查找主资源在目标资产列表中的现有 Stack
+    // 关键约束：只筛选 primaryAssetId 在 assetIds 中的 Stack，而非"包含任一目标资产"的 Stack
     const stacks = await tx
       .selectFrom('stack')
       .where('stack.ownerId', '=', entity.ownerId)
