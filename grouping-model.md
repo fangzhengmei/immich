@@ -677,18 +677,73 @@ CREATE INDEX idx_asset_live_photo_video_id ON asset(livePhotoVideoId);
 CREATE INDEX idx_asset_owner_id ON asset(ownerId);
 CREATE INDEX idx_asset_local_date_time ON asset((localDateTime AT TIME ZONE 'UTC')::date);
 
--- Album 关联索引
--- album_asset: (albumId, assetId) 复合主键天然支持按 albumId 查询
--- 需要额外索引支持按 assetId 反向查询（隐式通过主键第二个字段）
+-- ============================================================
+-- album_asset 索引行为分析（真实实现：server/src/schema/tables/album-asset.table.ts）
+-- ============================================================
+-- 实际定义：只有复合主键，无其他索引
+-- PRIMARY KEY (albumId, assetId)
+--
+-- PostgreSQL B-树复合索引命中规则（左前缀匹配原则）：
+-- ┌───────────────────────────────────────────┬─────────────┬──────────────────────────────────────┐
+-- │ 查询条件                                  │ 能否命中？  │ 说明                                 │
+-- ├───────────────────────────────────────────┼─────────────┼──────────────────────────────────────┤
+-- │ WHERE albumId = ?                         │ ✓ 完全命中  │ 使用前缀列 albumId                   │
+-- │ WHERE albumId = ? AND assetId = ?         │ ✓ 完全命中  │ 使用完整主键（相册内查特定资产）     │
+-- │ WHERE assetId = ?                         │ ✗ 不能命中  │ 非前缀列，无法利用 PK 索引           │
+-- │ WHERE assetId IN (?, ?, ?)                │ ✗ 不能命中  │ 同上，反向查资产所属相册走全表扫描   │
+-- └───────────────────────────────────────────┴─────────────┴──────────────────────────────────────┘
+--
+-- 关键注意：PostgreSQL 不会为 FOREIGN KEY 自动创建索引；@ForeignKeyColumn 注解只有显式加 index: true
+-- 才会创建单列索引。album_asset 两列都只有 primary: true，没有 index: true，因此只有 PK 索引。
+-- 实际查询：album.getByAssetId() → WHERE album_asset.assetId = ? → 走全表扫描，大数据量下性能差。
 
--- Tag 关联索引
--- tag_asset: (tagId, assetId) 复合主键
-CREATE INDEX idx_tag_asset_asset_id ON tag_asset(assetId);  -- 反向查询优化
+-- ============================================================
+-- tag_asset 索引行为分析（真实实现：server/src/schema/tables/tag-asset.table.ts）
+-- ============================================================
+-- 实际定义：四个索引（PK + 两个单列索引 + 反向复合索引）
+-- 1. PRIMARY KEY (tagId, assetId)                          -- 正向主索引
+-- 2. INDEX idx_tag_asset_tag_id (tagId)                    -- tagId 单列索引
+-- 3. INDEX idx_tag_asset_asset_id (assetId)                -- assetId 单列索引
+-- 4. INDEX idx_tag_asset_assetid_tagid (assetId, tagId)    -- 反向复合索引
+--
+-- PostgreSQL B-树索引命中矩阵：
+-- ┌───────────────────────────────────────────┬─────────────┬──────────────────────────────────────┐
+-- │ 查询条件                                  │ 能否命中？  │ 使用哪个索引                        │
+-- ├───────────────────────────────────────────┼─────────────┼──────────────────────────────────────┤
+-- │ WHERE tagId = ?                           │ ✓ 多重命中 │ PK 前缀 + 单列索引 idx_tag_asset_tag_id │
+-- │ WHERE tagId = ? AND assetId = ?           │ ✓ 完全命中 │ PK 完整匹配或单列索引相交           │
+-- │ WHERE assetId = ?                         │ ✓ 完全命中 │ idx_tag_asset_asset_id 单列         │
+-- │ WHERE assetId IN (?, ?, ?)                │ ✓ 完全命中 │ idx_tag_asset_asset_id 单列         │
+-- │ WHERE assetId = ? AND tagId = ?           │ ✓ 完全命中 │ 反向复合索引 idx_tag_asset_assetid_tagid 前缀 │
+-- └───────────────────────────────────────────┴─────────────┴──────────────────────────────────────┘
+--
+-- 实际查询：tag.getAssetIds(tagId, assetIds)
+--   → WHERE tagId = ? AND assetId IN (...)
+--   → PostgreSQL 规划器可选：PK 前缀过滤 tagId 后再过滤 assetId；或用两个单列索引 BitmapAnd；
+--     通常选择 PK 路径，性能最优。
+-- 实际查询：按 assetId 反查所有标签（如删除资产时清理标签）
+--   → WHERE assetId = ?
+--   → 命中 idx_tag_asset_asset_id 单列索引，性能良好。
 
--- 闭包表索引
--- tag_closure: (id_ancestor, id_descendant) 复合主键
--- 支持树结构的向上/向下遍历
+-- ============================================================
+-- tag_closure 闭包表索引
+-- ============================================================
+-- PRIMARY KEY (id_ancestor, id_descendant)
+--   → WHERE id_ancestor = ?  -- 查所有后代：命中前缀
+--   → WHERE id_descendant = ? -- 查所有祖先：不能命中 PK，但通常需额外单列索引
 ```
+
+### 索引设计对比总结
+
+| 维度 | album_asset | tag_asset |
+|-----|------------|----------|
+| 正向查（分组 → 资源） | ✓ PK 前缀支持 | ✓ PK 前缀 + 单列索引 |
+| 反向查（资源 → 分组） | ✗ 无单列索引，全表扫描 | ✓ 单列索引 + 反向复合索引前缀 |
+| 索引冗余度 | 低（仅 1 个 PK） | 高（4 个索引） |
+| 典型查询性能 | 查相册内资产快；查资产所属相册慢 | 双向查询均快 |
+| 写入开销 | 低 | 较高（4 个 B-树需维护） |
+
+**性能影响边界**：`album.getByAssetIds` 批量查询多个资产所属相册时，因 assetId 列无独立索引，每批资产只能对 `album_asset` 做全表或索引扫描。当用户相册数达到 10 万+、关联记录百万级时，该查询会成为明显性能瓶颈。`tag_asset` 因双向均有冗余索引，同量级数据下性能稳定。
 
 ### 5.2 时间线查询中的 Stack 过滤
 
@@ -723,7 +778,8 @@ Immich 的分组模型采用"关系正交"设计原则：
 5. **权限隔离**：每种分组操作有独立权限控制点，支持精细化共享管理
 
 ### 关键约束边界汇总
-- **Stack**：一个资源最多属于一个 Stack；主资源不可移除；创建时自动合并冲突 Stack
+- **Stack**：一个资源最多属于一个 Stack；主资源不可从 Stack 中移除；创建时仅合并「主资源在目标资产列表中」的旧 Stack，非主资源所在 Stack 不会被自动合并
+- **索引性能**：`album_asset` 通过资产反向查相册无单列索引、依赖 PK 前缀；`tag_asset` 双向均有单列 + 复合索引支持高频反向查询
 - **Live Photo**：关联视频自动隐藏、自动从相册移除；Android 运动照片不可解除链接
 - **Album**：资源可多相册归属；批量添加有重复检查和权限校验
 - **Tag**：标签树通过闭包表维护；删除标签时自动清理所有后代关联
