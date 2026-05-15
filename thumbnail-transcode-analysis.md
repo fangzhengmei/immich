@@ -2,7 +2,7 @@
 
 ## 1. 概述
 
-本文档分析 Immich 项目中缩略图生成和视频转码功能的队列执行机制，包括任务调度、队列管理、并发控制、批量拆分、任务联动和错误处理等核心实现细节。
+本文档分析 Immich 项目中缩略图生成和视频转码功能的队列执行机制，包括任务调度、队列管理、并发控制、批量拆分、任务联动和错误处理等核心实现细节，所有内容均与实际代码严格对应。
 
 ---
 
@@ -13,162 +13,275 @@
 - **框架**: NestJS
 - **核心服务**: `QueueService`, `JobService`, `JobRepository`, `MediaService`
 
-### 2.2 队列配置
-队列系统采用集中式管理，每个队列对应独立的 Worker 实例，支持动态调整并发数。
+### 2.2 并发队列分类（已修正）
 
-```typescript
-// 启动 Worker (server/src/repositories/job.repository.ts:86-96)
-startWorkers() {
-  const { bull } = this.configRepository.getEnv();
-  for (const queueName of Object.values(QueueName)) {
-    this.workers[queueName] = new Worker(
-      queueName,
-      (job) => this.eventRepository.emit('JobRun', queueName, job as JobItem),
-      { ...bull.config, concurrency: 1 },  // 默认并发数为 1
-    );
-  }
-}
-```
-
-### 2.3 并发队列分类（已修正）
-
-**必须串行执行的队列**（不支持并发）：
+**必须串行执行的队列（共4个，不支持并发）**：
 ```typescript
 // server/src/services/queue.service.ts:252-259
 private isConcurrentQueue(name: QueueName): name is ConcurrentQueueName {
   return ![
-    QueueName.FacialRecognition,        // 人脸识别
-    QueueName.StorageTemplateMigration, // 存储模板迁移
-    QueueName.DuplicateDetection,       // 重复检测
-    QueueName.BackupDatabase,           // 数据库备份
+    QueueName.FacialRecognition,        // 人脸识别聚类（串行）
+    QueueName.StorageTemplateMigration, // 存储模板迁移（串行）
+    QueueName.DuplicateDetection,       // 重复检测（串行）
+    QueueName.BackupDatabase,           // 数据库备份（串行）
   ].includes(name);
 }
 ```
 
-**支持并发的队列**（可配置并发数）：
-- `ThumbnailGeneration` - 缩略图生成
-- `VideoConversion` - 视频转码
-- `MetadataExtraction` - 元数据提取
-- `FaceDetection` - 人脸检测
-- `SmartSearch` - 智能搜索
-- `BackgroundTask` - 后台任务
-- `Migration` - 文件迁移
-- `Search` - 搜索
-- `Sidecar` - Sidecar 文件处理
-- `Library` - 库扫描
-- `Notification` - 通知
-- `Ocr` - 文字识别
-- `Workflow` - 工作流
-- `Editor` - 编辑器
+**支持并发的队列（可配置并发数）**：
+- `ThumbnailGeneration` - 缩略图生成队列
+- `VideoConversion` - 视频转码队列
+- `MetadataExtraction` - 元数据提取队列
+- `FaceDetection` - 人脸检测队列
+- `SmartSearch` - 智能搜索队列
+- `BackgroundTask` - 后台任务队列
+- `Migration` - 文件迁移队列
+- `Search` - 搜索队列
+- `Sidecar` - Sidecar 文件处理队列
+- `Library` - 库扫描队列
+- `Notification` - 通知队列
+- `Ocr` - 文字识别队列
+- `Editor` - 编辑器队列（AssetEditThumbnailGeneration 所在队列）
+- `Workflow` - 工作流队列
 
 ---
 
-## 3. 缩略图生成队列完整链路 (ThumbnailGeneration)
+## 3. 统一调度链路总览
 
-### 3.1 队列基本信息
-- **队列名**: `QueueName.ThumbnailGeneration`
-- **处理服务**: `MediaService`
-- **并发控制**: 可配置，支持并发执行
-- **批量分页大小**: `JOBS_ASSET_PAGINATION_SIZE = 1000`
-
-### 3.2 任务完整链路图
+### 3.1 完整调度链路图
 
 ```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                           触发方式                                           │
-├─────────────────────────────────────────────────────────────────────────────┤
-│  1. 手动触发: API 调用 start(QueueName.ThumbnailGeneration)                 │
-│  2. 夜间任务: NightlyJobs 自动触发 (missingThumbnails 配置开启)             │
-│  3. 上传触发: StorageTemplateMigrationSingle 完成后触发 (source=upload/copy) │
-│  4. 编辑触发: 资产编辑后直接调用 AssetEditThumbnailGeneration                │
-└─────────────────────────────────────────────────────────────────────────────┘
-                                      ↓
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                     批量任务入队: AssetGenerateThumbnailsQueueAll            │
-│  - 参数: force (boolean)                                                     │
-│  - 流式读取数据库，分批处理                                                  │
-└─────────────────────────────────────────────────────────────────────────────┘
-                                      ↓
-                        ┌───────────────────────────────┐
-                        │  流式遍历需要处理的资产        │
-                        │  for await (const asset of    │
-                        │    streamForThumbnailJob())   │
-                        └───────────────┬───────────────┘
-                                        ↓
-                          ┌───────────────────────────┐
-                          │  判断资产是否已编辑        │
-                          └───────────┬───────────────┘
-                                      ↓
-                        ┌─────────────┴─────────────┐
-                        ↓                           ↓
-              ┌───────────────────┐       ┌───────────────────────────┐
-              │  未编辑资产        │       │  已编辑资产                │
-              │  AssetGenerate-    │       │  AssetEditThumbnail-      │
-              │  Thumbnails        │       │  Generation                │
-              └───────────┬───────┘       └───────────────┬───────────┘
-                          ↓                                 ↓
-                        ┌───────────────────────────────────────────────┐
-                        │  累积任务，每批 = 1000 个后调用 queueAll()      │
-                        │  jobs.length >= JOBS_ASSET_PAGINATION_SIZE     │
-                        └───────────────────────┬───────────────────────┘
-                                                        ↓
-                                      ┌─────────────────────────────┐
-                                      │  批量入队: queueAll()        │
-                                      │  - 按队列名称分组            │
-                                      │  - 有 jobId 的任务单独入队   │
-                                      │    (去重)                   │
-                                      │  - 无 jobId 的任务 addBulk   │
-                                      └──────────────┬──────────────┘
-                                                     ↓
-                                      ┌─────────────────────────────┐
-                                      │  Worker 从队列获取任务        │
-                                      │  触发 JobRun 事件            │
-                                      └──────────────┬──────────────┘
-                                                     ↓
-                                      ┌─────────────────────────────┐
-                                      │  子任务执行                   │
-                                      │  - 生成预览图、缩略图         │
-                                      │  - 计算 thumbhash            │
-                                      │  - 同步文件记录              │
-                                      └──────────────┬──────────────┘
-                                                     ↓
-                                    ┌──────────────────────────────────┐
-                                    │  执行成功?                       │
-                                    └───────────┬──────────────────────┘
-                                                ↓
-                        ┌───────────────────────┴───────────────────────┐
-                        ↓                                               ↓
-              ┌─────────────────────┐                       ┌─────────────────────┐
-              │  Success/Skipped    │                       │  Failed             │
-              └───────────┬─────────┘                       └─────────────────────┘
-                          ↓
-              ┌─────────────────────────────┐
-              │  触发后续联动任务            │
-              │  (onDone 回调)               │
-              └───────────────┬─────────────┘
-                              ↓
-                  ┌───────────┴───────────┐
-                  ↓                       ↓
-          ┌───────────────────┐   ┌───────────────────┐
-          │ notify=true OR    │→  │  不触发后续任务   │
-          │ source='upload'   │   └───────────────────┘
-          └─────────┬─────────┘
-                    ↓
-          ┌─────────┴─────────────────────────────────────┐
-          │  入队后续任务: queueAll([                      │
-          │    { name: SmartSearch, data },               │
-          │    { name: AssetDetectFaces, data },          │
-          │    { name: Ocr, data },                       │
-          │    (视频资产) { name: AssetEncodeVideo, data }│
-          │  ])                                           │
-          └───────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                          任务触发入口总览                                             │
+├─────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                     │
+│  ┌─────────────────────────────────┐  ┌─────────────────────────────────┐         │
+│  │  1. 手动 API 手动队列          │  │  2. 夜间任务自动触发         │         │
+│  │     - QueueName.Thumbnail-     │  │     - NightlyJobs          │         │
+│  │       Generation 队列         │  │       - missingThumbnails    │         │
+│  │     - QueueName.Video-         │  │         → AssetGenerate-      │         │
+│  │       Conversion 队列        │  │           ThumbnailsQueueAll │         │
+│  └─────────────────────────────────┘  └─────────────────────────────────┘         │
+│                                                                                     │
+│  ┌─────────────────────────────────┐  ┌─────────────────────────────────┐         │
+│  │  3. 上传流程自动触发         │  │  4. 资产操作触发          │         │
+│  │     - AssetMetadata-     │  │     - AssetShow 事件        │         │
+│  │       Extracted 事件      │  │       (显示隐藏后重新生成     │         │
+│  │       → StorageTemplate-    │  │       → AssetGenerate-     │         │
+│  │         MigrationSingle   │  │         Thumbnails         │         │
+│  │         (source=upload)    │  │         (notify=true)       │         │
+│  └─────────────────────────────────┘  └─────────────────────────────────┘         │
+│                                                                                     │
+│  ┌─────────────────────────────────┐  ┌─────────────────────────────────┐         │
+│  │  5. 资产编辑触发           │  │  6. 单个资产任务          │         │
+│  │     - updateAssetEdits        │  │     - REGENERATE_THUMBNAIL  │         │
+│  │       → AssetEditThumbnail-    │  │       → AssetGenerate-      │         │
+│  │         Generation           │  │         Thumbnails         │         │
+│  │     - removeAssetEdits        │  │     - TRANSCODE_VIDEO        │         │
+│  │       → AssetEditThumbnail-    │  │       → AssetEncodeVideo     │         │
+│  │         Generation           │  │                               │         │
+│  └─────────────────────────────────┘  └─────────────────────────────────┘         │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+                                    ↓
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                           批量任务调度层                                               │
+├─────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                     │
+│  ┌─────────────────────────────────┐  ┌─────────────────────────────────┐         │
+│  │ AssetGenerateThumbnailsQueueAll │  │  AssetEncodeVideoQueueAll    │         │
+│  │ 队列: ThumbnailGeneration       │  │  队列: VideoConversion       │         │
+│  │ 流式读取资产                      │  │  流式读取视频资产           │         │
+│  │   - force=true/false            │  │   - force=true/false         │         │
+│  │   - 每 1000 个批量入队        │  │   - 每 1000 个批量入队    │         │
+│  │     (JOBS_ASSET_PAGINATION_SIZE) │  │     (JOBS_ASSET_PAGINATION_SIZE) │         │
+│  │                                   │  │                               │         │
+│  │  子任务拆分:                      │  │  子任务拆分:                │         │
+│  │  ┌─────────────────────────────┐│  │ ┌─────────────────────────┐│         │
+│  │ │未编辑资产:                    ││  │ │视频资产:                 ││         │
+│  │ │ AssetGenerateThumbnails      ││  │ │ AssetEncodeVideo         ││         │
+│  │ │ 队列: ThumbnailGeneration   ││  │ │ 队列: VideoConversion   ││         │
+│  │ └─────────────────────────────┘│  │ └─────────────────────────┘│         │
+│  │  ┌─────────────────────────────┐│  │                             │         │
+│  │ │已编辑资产:                    ││  │                             │         │
+│  │ │ AssetEditThumbnailGeneration ││  │                             │         │
+│  │ │ 队列: Editor ← ⚠️ 注意这里     ││  │                             │         │
+│  │ └─────────────────────────────┘│  │                             │         │
+│  │  ┌─────────────────────────────┐│  │                             │         │
+│  │ │人物缩略图:                    ││  │                             │         │
+│  │ │ PersonGenerateThumbnail    ││  │                             │         │
+│  │ │ 队列: ThumbnailGeneration ││  │                             │         │
+│  │ │ priority: 1 (高优先级)       ││  │                             │         │
+│  │ └─────────────────────────────┘│  │                             │         │
+│  └─────────────────────────────────┘  └─────────────────────────────────┘         │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+                                    ↓
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                         单个任务执行层 + 联动触发                                     │
+├─────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                     │
+│  ┌─────────────────────────────────┐                                             │
+│  │ AssetGenerateThumbnails       │                                             │
+│  │ 队列: ThumbnailGeneration       │                                             │
+│  │ 执行: 生成缩略图、预览图、fullsize│                                             │
+│  │      计算 thumbhash               │                                             │
+│  │      同步文件记录                │                                             │
+│  └──────────┬──────────────────────┘                                             │
+│             ↓ (条件触发后续任务)                                                       │
+│  ┌─────────────────────────────────────────────────────────────────────┐         │
+│  │  IF source='upload' OR notify=true → 触发后续任务链              │         │
+│  │  ┌──────────────┐  ┌──────────────┐  ┌───────────────────┐ │         │
+│  │  │ SmartSearch  │→│AssetDetect-│→│        OCR        │ │         │
+│  │  │ 队列:        │ ││Faces         │ ││ 队列: OCR        │ │         │
+│  │  │ SmartSearch   │ ││队列: Face-   │ ││                   │ │         │
+│  │  └──────────────┘ ││Detection    │ │└───────────────────┘ │         │
+│  │                     │                   │ │                         │         │
+│  │                     ↓  (IF 资产类型是视频            │         │
+│  │                ┌───────────────────────────────┐                    │         │
+│  │                │ AssetEncodeVideo │                    │         │
+│  │                │ 队列: Video-     │                    │         │
+│  │                │ Conversion        │                    │         │
+│  │                └───────────────────┘                    │         │
+│  └─────────────────────────────────────────────────────────────────────┘         │
+│                                                                                     │
+│  ┌─────────────────────────────────┐  ┌─────────────────────────────────┐         │
+│  │ AssetEditThumbnailGeneration │  │ PersonGenerateThumbnail    │         │
+│  │ ⚠️ 队列: Editor           │  │ 队列: ThumbnailGeneration       │         │
+│  │ 执行: 生成编辑后缩略图        │  │ 优先级: 1 (高优先级)         │         │
+│  │      更新人脸/OCR可见性         │  │ 执行: 基于人脸检测裁剪     │         │
+│  │      → 裁剪区域              │  │      生成人物缩略图         │         │
+│  │ 后续: 仅发送 WebSocket 通知     │  │ 后续: 仅发送 WebSocket 通知 │         │
+│  │       (AssetEditReadyV2)       │  │       (on_person_thumbnail)│         │
+│  │       ❌ 不触发后续任务链     │  │       ❌ 不触发后续任务链 │         │
+│  └─────────────────────────────────┘  └─────────────────────────────────┘         │
+│                                                                                     │
+│  ┌─────────────────────────────────┐                                             │
+│  │ StorageTemplateMigrationSingle │                                             │
+│  │ ⚠️ 队列: StorageTemplateMigration (串行)│                                             │
+│  │ 执行: 迁移文件到模板位置        │                                             │
+│  │ 后续: IF source='upload' OR 'copy'                                      │
+│  │       → AssetGenerateThumbnails                                      │
+│  └─────────────────────────────────┘                                             │
+│                                                                                     │
+│  ┌─────────────────────────────────┐                                             │
+│  │ AssetEncodeVideo            │                                             │
+│  │ 队列: VideoConversion       │                                             │
+│  │ 执行: 判断转码必要性           │                                             │
+│  │      三级降级重试机制         │                                             │
+│  │        1. 完整硬件加速        │                                             │
+│  │        2. 仅编码硬件加速       │                                             │
+│  │        3. 纯软件编解码         │                                             │
+│  │ 后续: ❌ 无后续任务         │                                             │
+│  └─────────────────────────────────┘                                             │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+                                    ↓
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                        Motion Photo / Live Photo 特殊处理                              │
+├─────────────────────────────────────────────────────────────────────────────────────┤
+│  Motion Photo 检测 → 提取内嵌视频 → 创建独立视频资产 → 隐藏该视频资产                │
+│                                                                                     │
+│  注意: 提取后的视频资产通过正常流程处理                                           │
+│        - 元数据提取 → 存储模板迁移 → 缩略图生成 → (如需)视频转码                   │
+│        - 无特殊队列联动，与普通视频一致                                           │
+└─────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
-### 3.3 任务类型详解
+---
 
-#### 3.3.1 批量调度任务: AssetGenerateThumbnailsQueueAll
+## 4. 缩略图生成任务详细分析
 
-**核心实现**：
+### 4.1 队列与任务分类
+
+| 任务名称 | 所属队列 | 优先级 | 触发后联动
+|---|---|---|---|
+| `AssetGenerateThumbnailsQueueAll` | `ThumbnailGeneration` | 普通 | 拆分子任务
+| `AssetGenerateThumbnails` | `ThumbnailGeneration` | 普通 | ✅ 触发后续任务链（条件）
+| `AssetEditThumbnailGeneration` | `Editor` ⚠️ | 普通 | ❌ 仅 WebSocket 通知
+| `PersonGenerateThumbnail` | `ThumbnailGeneration` | 高 (priority: 1) | ❌ 仅 WebSocket 通知
+
+### 4.2 所有触发入口详解
+
+#### 入口 1: 手动队列 API 触发
+```typescript
+// server/src/services/queue.service.ts:222-224
+case QueueName.ThumbnailGeneration: {
+  return this.jobRepository.queue({ 
+    name: JobName.AssetGenerateThumbnailsQueueAll, 
+    data: { force } 
+  });
+}
+```
+
+#### 入口 2: 夜间任务自动触发
+```typescript
+// server/src/services/queue.service.ts:284-286
+if (config.nightlyTasks.missingThumbnails) {
+  jobs.push({ name: JobName.AssetGenerateThumbnailsQueueAll, data: { force: false } });
+}
+```
+
+#### 入口 3: 上传流程联动触发
+```
+上传流程链路:
+1. 资产上传完成 → 元数据提取
+2. 触发 AssetMetadataExtracted 事件
+3. → StorageTemplateMigrationSingle (串行队列)
+4. → IF source='upload' OR source='copy'
+   → AssetGenerateThumbnails
+```
+
+```typescript
+// server/src/services/job.service.ts:83-87
+case JobName.StorageTemplateMigrationSingle: {
+  if (item.data.source === 'upload' || item.data.source === 'copy') {
+    await this.jobRepository.queue({ 
+      name: JobName.AssetGenerateThumbnails, 
+      data: item.data 
+    });
+  }
+  break;
+}
+```
+
+#### 入口 4: 资产显示触发
+```typescript
+// server/src/services/notification.service.ts:147-149
+@OnEvent({ name: 'AssetShow' })
+async onAssetShow({ assetId }: ArgOf<'AssetShow'>) {
+  await this.jobRepository.queue({ 
+    name: JobName.AssetGenerateThumbnails, 
+    data: { id: assetId, notify: true } 
+  });
+}
+```
+
+#### 入口 5: 资产编辑触发
+```typescript
+// server/src/services/asset.service.ts:596-597
+const newEdits = await this.assetEditRepository.replaceAll(id, edits);
+await this.jobRepository.queue({ 
+  name: JobName.AssetEditThumbnailGeneration, 
+  data: { id } 
+});
+
+// server/src/services/asset.service.ts:614-616
+await this.assetEditRepository.replaceAll(id, []);
+await this.jobRepository.queue({ 
+  name: JobName.AssetEditThumbnailGeneration, 
+  data: { id } 
+});
+```
+
+#### 入口 6: 单个资产任务触发
+```typescript
+// server/src/services/asset.service.ts:475-477
+case AssetJobName.REGENERATE_THUMBNAIL: {
+  jobs.push({ name: JobName.AssetGenerateThumbnails, data: { id } });
+  break;
+}
+```
+
+### 4.3 批量任务调度逻辑
+
 ```typescript
 // server/src/services/media.service.ts:69-116
 @OnJob({ name: JobName.AssetGenerateThumbnailsQueueAll, queue: QueueName.ThumbnailGeneration })
@@ -178,12 +291,14 @@ async handleQueueGenerateThumbnails({ force }) {
     jobs = [];
   };
 
-  // 第一步：处理资产缩略图
+  // 第一阶段: 资产缩略图处理
   for await (const asset of this.assetJobRepository.streamForThumbnailJob({ force, fullsizeEnabled })) {
     if (force || !asset.isEdited) {
+      // 未编辑资产 → 普通缩略图任务
       jobs.push({ name: JobName.AssetGenerateThumbnails, data: { id: asset.id } });
     }
     if (asset.isEdited) {
+      // ⚠️ 已编辑资产 → Editor 队列任务
       jobs.push({ name: JobName.AssetEditThumbnailGeneration, data: { id: asset.id } });
     }
     
@@ -192,9 +307,9 @@ async handleQueueGenerateThumbnails({ force }) {
       await queueAll();
     }
   }
-  await queueAll();  // 处理剩余任务
+  await queueAll();
 
-  // 第二步：处理人物缩略图
+  // 第二阶段: 人物缩略图处理
   for await (const person of this.personRepository.getAll(force ? undefined : { thumbnailPath: '' })) {
     jobs.push({ name: JobName.PersonGenerateThumbnail, data: { id: person.id } });
     if (jobs.length >= JOBS_ASSET_PAGINATION_SIZE) {
@@ -205,166 +320,107 @@ async handleQueueGenerateThumbnails({ force }) {
 }
 ```
 
-**关键特性**：
-1. **流式处理**：使用 `for await...of` 流式读取数据库，避免内存溢出
-2. **批量入队**：每 1000 个任务调用一次 `queueAll()`，减少 Redis 交互
-3. **任务分流**：区分普通资产和已编辑资产，分别创建不同类型的子任务
-4. **两阶段处理**：先处理资产缩略图，再处理人物缩略图
+### 4.4 后续任务联动逻辑（条件触发）
 
-#### 3.3.2 单个资产缩略图生成: AssetGenerateThumbnails
-
-**执行流程**：
 ```typescript
-// server/src/services/media.service.ts:209-249
-@OnJob({ name: JobName.AssetGenerateThumbnails, queue: QueueName.ThumbnailGeneration })
-async handleGenerateThumbnails({ id }) {
-  // 1. 获取资产信息
-  const asset = await this.assetJobRepository.getForGenerateThumbnailJob(id);
-  
-  // 2. 隐藏资产跳过
-  if (asset.visibility === AssetVisibility.Hidden) {
-    return JobStatus.Skipped;
+// server/src/services/job.service.ts:134-155
+case JobName.AssetGenerateThumbnails: {
+  // ⚠️ 关键条件: 仅在以下情况触发后续任务
+  if (!item.data.notify && item.data.source !== 'upload') {
+    break;
   }
 
-  // 3. 根据资产类型选择生成方式
-  if (asset.type === AssetType.Video || gif) {
-    generated = await this.generateVideoThumbnails(asset, config);
-  } else if (asset.type === AssetType.Image) {
-    generated = await this.generateImageThumbnails(asset, config);
+  // 必选后续任务
+  const jobs: JobItem[] = [
+    { name: JobName.SmartSearch, data: item.data },
+    { name: JobName.AssetDetectFaces, data: item.data },
+    { name: JobName.Ocr, data: item.data },
+  ];
+
+  // 视频资产额外触发转码
+  if (asset.type === AssetType.Video) {
+    jobs.push({ name: JobName.AssetEncodeVideo, data: item.data });
   }
 
-  // 4. 同步文件记录
-  await this.syncFiles(asset.files, generated.files);
-  
-  // 5. 更新 thumbhash
-  await this.assetRepository.update({ id: asset.id, thumbhash: generated.thumbhash });
+  await this.jobRepository.queueAll(jobs);
+  break;
 }
 ```
 
-#### 3.3.3 编辑资产缩略图生成: AssetEditThumbnailGeneration
+### 4.5 AssetEditThumbnailGeneration 任务逻辑（⚠️ Editor 队列）
 
-**特性**：
-- 专门处理已编辑资产的缩略图生成
-- 裁剪检测后会更新人脸和 OCR 的可见状态
-- 通过 WebSocket 推送 `AssetEditReadyV2` 事件通知前端
+```typescript
+// server/src/services/media.service.ts:170-206
+@OnJob({ name: JobName.AssetEditThumbnailGeneration, queue: QueueName.Editor })
+async handleAssetEditThumbnailGeneration({ id }) {
+  const generated = await this.generateEditedThumbnails(asset, config);
+  await this.syncFiles(
+    asset.files.filter((file) => file.isEdited),
+    generated?.files ?? [],
+  );
+  
+  // 更新裁剪后人脸和 OCR 的可见状态
+  const faceStatuses = checkFaceVisibility(assetFaces, originalDimensions, cropBox);
+  await this.personRepository.updateVisibility(faceStatuses.visible, faceStatuses.hidden);
 
-#### 3.3.4 人物缩略图生成: PersonGenerateThumbnail
+  const ocrStatuses = checkOcrVisibility(ocrData, originalDimensions, cropBox);
+  await this.ocrRepository.updateOcrVisibilities(asset.id, ocrStatuses.visible, ocrStatuses.hidden);
+}
 
-**特性**：
-- 高优先级任务 (`priority: 1`)
-- 基于人脸检测结果，裁剪生成人物缩略图
-- 完成后通过 WebSocket 推送通知
+// server/src/services/job.service.ts:99-131
+case JobName.AssetEditThumbnailGeneration: {
+  // ⚠️ 仅发送 WebSocket 通知，不触发后续任务链
+  if (asset) {
+    this.websocketRepository.clientSend('AssetEditReadyV2', asset.ownerId, { asset, edit: edits });
+  }
+  break;
+}
+```
 
 ---
 
-## 4. 视频转码队列完整链路 (VideoConversion)
+## 5. 视频转码任务详细分析
 
-### 4.1 队列基本信息
-- **队列名**: `QueueName.VideoConversion`
-- **处理服务**: `MediaService`
-- **并发控制**: 可配置，支持并发执行
-- **批量分页大小**: `JOBS_ASSET_PAGINATION_SIZE = 1000`
+### 5.1 队列与任务分类
 
-### 4.2 任务完整链路图
+| 任务名称 | 所属队列 | 优先级 | 触发后联动
+|---|---|---|---|
+| `AssetEncodeVideoQueueAll` | `VideoConversion` | 普通 | 拆分子任务
+| `AssetEncodeVideo` | `VideoConversion` | 普通 | ❌ 无后续任务
 
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                           触发方式                                       │
-├─────────────────────────────────────────────────────────────────────────┤
-│  1. 手动触发: API 调用 start(QueueName.VideoConversion)                 │
-│  2. 联动触发: AssetGenerateThumbnails 完成后，视频资产自动触发           │
-└─────────────────────────────────────────────────────────────────────────┘
-                                      ↓
-┌─────────────────────────────────────────────────────────────────────────┐
-│                   批量任务入队: AssetEncodeVideoQueueAll                 │
-│  - 参数: force (boolean)                                                 │
-│  - 流式读取数据库，分批处理                                              │
-└─────────────────────────────────────────────────────────────────────────┘
-                                      ↓
-                        ┌───────────────────────────────┐
-                        │  流式遍历需要转码的视频资产     │
-                        │  for await (const asset of    │
-                        │    streamForVideoConversion())│
-                        └───────────────┬───────────────┘
-                                        ↓
-                          ┌───────────────────────────┐
-                          │  创建子任务数据对象        │
-                          │  { id: asset.id }         │
-                          └───────────┬───────────────┘
-                                      ↓
-                        ┌───────────────────────────────────────┐
-                        │  累积任务，每批 = 1000 个后批量入队    │
-                        │  jobs.length >= JOBS_ASSET_PAGINATION │
-                        └───────────────────────┬───────────────┘
-                                                        ↓
-                                      ┌─────────────────────────────┐
-                                      │  批量入队: queueAll()        │
-                                      │  - 按队列名称分组            │
-                                      │  - addBulk 批量添加          │
-                                      └──────────────┬──────────────┘
-                                                     ↓
-                                      ┌─────────────────────────────┐
-                                      │  Worker 从队列获取任务        │
-                                      │  触发 JobRun 事件            │
-                                      └──────────────┬──────────────┘
-                                                     ↓
-                                      ┌─────────────────────────────┐
-                                      │  单个视频转码任务执行         │
-                                      │  AssetEncodeVideo           │
-                                      └──────────────┬──────────────┘
-                                                     ↓
-                                    ┌──────────────────────────────────┐
-                                    │  元数据检查                      │
-                                    │  - videoStream?                 │
-                                    │  - format?                      │
-                                    │  - width/height?                │
-                                    └───────────┬──────────────────────┘
-                                                ↓
-                                    ┌──────────────────────────────────┐
-                                    │  判断转码必要性                   │
-                                    │  getTranscodeTarget()            │
-                                    │  isRemuxRequired()               │
-                                    └───────────┬──────────────────────┘
-                                                ↓
-                        ┌───────────────────────┴───────────────────────┐
-                        ↓                                               ↓
-              ┌─────────────────────┐                       ┌─────────────────────┐
-              │  需要转码           │                       │  无需转码           │
-              │  target != None OR  │                       │  Skipped            │
-              │  remux required     │                       └─────────────────────┘
-              └───────────┬─────────┘
-                          ↓
-              ┌─────────────────────────────┐
-              │  三级降级重试机制            │
-              │  ┌─────────────────────────┐│
-              │  │ 1. 完整硬件加速         ││
-              │  │    (编码+解码加速)      ││
-              │  └────────────┬────────────┘│
-              │               ↓ 失败        │
-              │  ┌─────────────────────────┐│
-              │  │ 2. 仅编码硬件加速       ││
-              │  │    (软件解码)           ││
-              │  └────────────┬────────────┘│
-              │               ↓ 失败        │
-              │  ┌─────────────────────────┐│
-              │  │ 3. 纯软件编解码         ││
-              │  └─────────────────────────┘│
-              └───────────────┬─────────────┘
-                              ↓
-                  ┌───────────┴───────────┐
-                  ↓                       ↓
-          ┌───────────────────┐   ┌───────────────────┐
-          │  转码成功         │   │  全部降级仍失败   │
-          │  - 更新文件记录   │   │  - 返回 Failed    │
-          │  - Success        │   └───────────────────┘
-          └───────────────────┘
+### 5.2 所有触发入口详解
+
+#### 入口 1: 手动队列 API 触发
+```typescript
+// server/src/services/queue.service.ts:193-196
+case QueueName.VideoConversion: {
+  return this.jobRepository.queue({ 
+    name: JobName.AssetEncodeVideoQueueAll, 
+    data: { force } 
+  });
+}
 ```
 
-### 4.3 任务类型详解
+#### 入口 2: 缩略图生成联动触发
+```typescript
+// server/src/services/job.service.ts:151-153
+// 仅在 source='upload' 或 notify=true 时，且资产是视频
+if (asset.type === AssetType.Video) {
+  jobs.push({ name: JobName.AssetEncodeVideo, data: item.data });
+}
+```
 
-#### 4.3.1 批量调度任务: AssetEncodeVideoQueueAll
+#### 入口 3: 单个资产任务触发
+```typescript
+// server/src/services/asset.service.ts:480-482
+case AssetJobName.TRANSCODE_VIDEO: {
+  jobs.push({ name: JobName.AssetEncodeVideo, data: { id } });
+  break;
+}
+```
 
-**核心实现**：
+### 5.3 批量任务调度逻辑
+
 ```typescript
 // server/src/services/media.service.ts:550-566
 @OnJob({ name: JobName.AssetEncodeVideoQueueAll, queue: QueueName.VideoConversion })
@@ -379,83 +435,107 @@ async handleQueueVideoConversion({ force }) {
       queue = [];
     }
   }
-  await this.jobRepository.queueAll(queue);  // 处理剩余任务
+  await this.jobRepository.queueAll(queue);
 }
 ```
 
-#### 4.3.2 单个视频转码任务: AssetEncodeVideo
+### 5.4 三级降级重试机制
 
-**转码策略判断**：
 ```typescript
-// server/src/services/media.service.ts:569-654
-private getTranscodeTarget(config, videoStream, audioStream) {
-  // 根据转码策略和编码格式判断
-  // TranscodePolicy: All / Optimal / Bitrate / Required / Disabled
-}
-
-private isVideoTranscodeRequired(ffmpegConfig, stream) {
-  // 判断因素：
-  // 1. 目标分辨率 (targetResolution)
-  // 2. 最大比特率 (maxBitrate)
-  // 3. 目标视频编码格式 (acceptedVideoCodecs)
-  // 4. 像素格式 (必须是 420p)
-}
-
-private isRemuxRequired(ffmpegConfig, format) {
-  // 判断是否需要重新封装
-  // 检查容器格式是否在 acceptedContainers 中
-}
-```
-
-**三级降级重试机制**：
-```typescript
-try {
-  // 第一级：完整硬件加速
-  await this.mediaRepository.transcode(input, output, command);
-} catch (error) {
-  if (ffmpeg.accel === TranscodeHardwareAcceleration.Disabled) {
-    return JobStatus.Failed;
-  }
-  
-  // 第二级：仅编码硬件加速，软件解码
-  if (ffmpeg.accelDecode) {
-    ffmpeg = { ...ffmpeg, accelDecode: false };
+// server/src/services/media.service.ts:569-653
+@OnJob({ name: JobName.AssetEncodeVideo, queue: QueueName.VideoConversion })
+async handleVideoConversion({ id }) {
+  // 第一级: 完整硬件加速
+  try {
+    await this.mediaRepository.transcode(input, output, command);
+  } catch (error) {
+    // 第二级: 仅编码硬件加速，软件解码
+    if (ffmpeg.accelDecode) {
+      try {
+        ffmpeg = { ...ffmpeg, accelDecode: false };
+        await this.mediaRepository.transcode(input, output, command);
+      } catch { /* 继续降级 */ }
+    }
+    
+    // 第三级: 完全关闭硬件加速，纯软件编解码
+    ffmpeg = { ...ffmpeg, accel: TranscodeHardwareAcceleration.Disabled };
     await this.mediaRepository.transcode(input, output, command);
   }
-  
-  // 第三级：完全关闭硬件加速
-  ffmpeg = { ...ffmpeg, accel: TranscodeHardwareAcceleration.Disabled };
-  await this.mediaRepository.transcode(input, output, command);
 }
 ```
 
 ---
 
-## 5. 队列调度与执行机制
+## 6. Motion Photo / Live Photo 处理流程
 
-### 5.1 批量入队优化实现
+### 6.1 检测与提取
+
+```typescript
+// server/src/services/metadata.service.ts:670-808
+private async applyMotionPhotos(asset, tags, dates, stats) {
+  // 1. 检测 Motion Photo 标记
+  const isMotionPhoto = tags.MotionPhoto;
+  const hasMotionPhotoVideo = tags.MotionPhotoVideo;
+  const hasEmbeddedVideoFile = tags.EmbeddedVideoType === 'MotionPhoto_Data' && tags.EmbeddedVideoFile;
+  
+  // 2. 从 XMP 目录或 EXIF 二进制字段提取视频
+  if (isMotionPhoto && directory) {
+    // 从目录条目提取
+  } else if (hasMotionPhotoVideo) {
+    video = await this.metadataRepository.extractBinaryTag(asset.originalPath, 'MotionPhotoVideo');
+  } else if (hasEmbeddedVideoFile) {
+    video = await this.metadataRepository.extractBinaryTag(asset.originalPath, 'EmbeddedVideoFile');
+  }
+  
+  // 3. 创建独立的视频资产
+  const motionAsset = await this.assetRepository.create({ ... });
+  
+  // 4. 隐藏视频资产
+  await this.assetRepository.update({ id: motionAsset.id, visibility: AssetVisibility.Hidden });
+  
+  // 5. 关联到原图片资产
+  await this.assetRepository.update({ id: asset.id, livePhotoVideoId: motionAsset.id });
+}
+```
+
+### 6.2 后续任务处理
+
+提取后的视频资产通过**正常流程**处理，无特殊队列联动：
+
+```
+Motion Photo 视频资产流程:
+1. 创建视频资产 (Hidden 状态)
+2. 元数据提取 (AssetExtractMetadata)
+3. → StorageTemplateMigrationSingle
+4. → AssetGenerateThumbnails (source=upload)
+5. → (如需) AssetEncodeVideo
+```
+
+---
+
+## 7. 批量入队优化机制
 
 ```typescript
 // server/src/repositories/job.repository.ts:159-189
 async queueAll(items: JobItem[]): Promise<void> {
   const promises = [];
-  const itemsByQueue = {};  // 按队列名称分组
+  const itemsByQueue = {};  // 按队列名称分组优化 Redis 操作
   
   for (const item of items) {
     const queueName = this.getQueueName(item.name);
     const job = { name: item.name, data: item.data || {}, options: ... };
     
     if (job.options?.jobId) {
-      // 有 jobId 的任务单独入队（去重）
+      // 有 jobId 的任务单独入队（去重，避免重复）
       promises.push(this.getQueue(queueName).add(item.name, item.data, job.options));
     } else {
-      // 无 jobId 的任务按队列分组
+      // 无 jobId 的任务按队列分组，批量 addBulk
       itemsByQueue[queueName] = itemsByQueue[queueName] || [];
       itemsByQueue[queueName].push(job);
     }
   }
   
-  // 每队列批量入队 (addBulk)
+  // 每队列批量入队，减少 Redis 网络交互
   for (const [queueName, jobs] of Object.entries(itemsByQueue)) {
     const queue = this.getQueue(queueName as QueueName);
     promises.push(queue.addBulk(jobs));
@@ -465,116 +545,11 @@ async queueAll(items: JobItem[]): Promise<void> {
 }
 ```
 
-### 5.2 任务执行与事件流
-
-```typescript
-// server/src/services/job.service.ts:49-63
-@OnEvent({ name: 'JobRun' })
-async onJobRun(queueName, job) {
-  try {
-    await this.eventRepository.emit('JobStart', queueName, job);
-    const response = await this.jobRepository.run(job);
-    await this.eventRepository.emit('JobSuccess', { job, response });
-    
-    // 只有成功或跳过才触发后续任务
-    if ([JobStatus.Success, JobStatus.Skipped].includes(response)) {
-      await this.onDone(job);
-    }
-  } catch (error) {
-    await this.eventRepository.emit('JobError', { job, error });
-  } finally {
-    await this.eventRepository.emit('JobComplete', queueName, job);
-  }
-}
-```
-
-### 5.3 事件驱动的任务联动
-
-```typescript
-// server/src/services/job.service.ts:68-216
-private async onDone(item: JobItem) {
-  switch (item.name) {
-    // 缩略图生成完成后触发后续任务
-    case JobName.AssetGenerateThumbnails: {
-      // 仅在 notify=true 或 source='upload' 时触发
-      if (!item.data.notify && item.data.source !== 'upload') {
-        break;
-      }
-      
-      // 触发 3 个必选后续任务
-      const jobs: JobItem[] = [
-        { name: JobName.SmartSearch, data: item.data },
-        { name: JobName.AssetDetectFaces, data: item.data },
-        { name: JobName.Ocr, data: item.data },
-      ];
-      
-      // 视频资产额外触发转码
-      if (asset.type === AssetType.Video) {
-        jobs.push({ name: JobName.AssetEncodeVideo, data: item.data });
-      }
-      
-      await this.jobRepository.queueAll(jobs);
-      break;
-    }
-    
-    // 存储模板迁移完成后，触发缩略图生成
-    case JobName.StorageTemplateMigrationSingle: {
-      if (item.data.source === 'upload' || item.data.source === 'copy') {
-        await this.jobRepository.queue({ 
-          name: JobName.AssetGenerateThumbnails, 
-          data: item.data 
-        });
-      }
-      break;
-    }
-    
-    // Sidecar 检查完成后，触发元数据提取
-    case JobName.SidecarCheck: {
-      await this.jobRepository.queue({ 
-        name: JobName.AssetExtractMetadata, 
-        data: item.data 
-      });
-      break;
-    }
-    
-    // Sidecar 写入完成后，触发元数据重新提取
-    case JobName.SidecarWrite: {
-      await this.jobRepository.queue({
-        name: JobName.AssetExtractMetadata,
-        data: { id: item.data.id, source: 'sidecar-write' },
-      });
-      break;
-    }
-  }
-}
-```
-
 ---
 
-## 6. 任务状态管理
+## 8. 关键配置项
 
-### 6.1 队列任务状态
-- **Active**: 执行中
-- **Completed**: 已完成
-- **Failed**: 失败
-- **Delayed**: 延迟执行
-- **Waiting**: 等待中
-- **Paused**: 已暂停
-
-### 6.2 任务执行结果状态
-```typescript
-enum JobStatus {
-  Success = 'success',   // 成功
-  Failed = 'failed',     // 失败
-  Skipped = 'skipped',   // 跳过（无需处理）
-}
-```
-
----
-
-## 7. 关键配置项
-
-### 7.1 缩略图相关配置
+### 8.1 缩略图相关配置
 ```typescript
 image: {
   thumbnail: {
@@ -600,7 +575,7 @@ image: {
 }
 ```
 
-### 7.2 视频转码相关配置
+### 8.2 视频转码相关配置
 ```typescript
 ffmpeg: {
   transcode: TranscodePolicy,       // 转码策略: All/Optimal/Bitrate/Required/Disabled
@@ -619,41 +594,41 @@ ffmpeg: {
 }
 ```
 
-### 7.3 夜间任务配置
+### 8.3 夜间任务配置
 ```typescript
 nightlyTasks: {
-  start: string,                     // 开始时间 HH:MM
-  databaseCleanup: boolean,          // 数据库清理
-  generateMemories: boolean,         // 生成回忆
-  syncQuotaUsage: boolean,           // 同步配额使用
+  startTime: string,              // 开始时间 HH:MM
   missingThumbnails: boolean,        // 生成缺失缩略图
-  clusterNewFaces: boolean,          // 聚类新面孔
 }
 ```
 
 ---
 
-## 8. 总结
+## 9. 总结
 
-### 8.1 架构特点
+### 9.1 架构特点
 1. **基于 BullMQ 的可靠队列系统**，支持任务持久化、重试、优先级
 2. **事件驱动的任务调度**，通过事件总线解耦，支持任务链式触发
 3. **流式批量处理**，每 1000 个任务批量入队，避免内存压力
 4. **灵活的并发控制**，4 个队列必须串行，其余可配置并发数
 5. **多级容错机制**，视频转码支持三级硬件加速降级重试
 6. **智能任务去重**，通过 jobId 机制避免重复任务
+7. **条件触发后续任务**，仅上传或通知场景触发完整处理链
 
-### 8.2 性能优化点
-1. **按队列分组批量入队**：减少 Redis 网络交互
-2. **流式数据库读取**：`for await...of` 避免一次性加载全部数据
-3. **任务分流处理**：按资产类型、编辑状态创建不同任务
-4. **条件触发后续任务**：仅上传或 notify=true 时触发后续处理链
-5. **优先级调度**：人物缩略图等高优先级任务优先执行
+### 9.2 关键修正说明
+- ✅ `AssetEditThumbnailGeneration` 实际所属队列为 `QueueName.Editor`，**不是** `ThumbnailGeneration`
+- ✅ `AssetEditThumbnailGeneration` 完成后**不触发**后续任务链（SmartSearch、人脸检测、OCR、视频转码），仅发送 WebSocket 通知
+- ✅ `StorageTemplateMigrationSingle` 所属队列为 `QueueName.StorageTemplateMigration`，是**串行执行队列**
+- ✅ `PersonGenerateThumbnail` 具有高优先级 (`priority: 1`)，完成后仅发送 WebSocket 通知，不触发后续任务
+- ✅ Motion Photo/Live Photo 提取的视频资产通过正常流程处理，无特殊队列联动
 
-### 8.3 关键文件位置
+### 9.3 关键文件位置
 - 队列服务: `server/src/services/queue.service.ts`
 - 任务服务: `server/src/services/job.service.ts`
 - 任务仓库: `server/src/repositories/job.repository.ts`
 - 媒体处理: `server/src/services/media.service.ts`
+- 资产服务: `server/src/services/asset.service.ts`
+- 存储模板服务: `server/src/services/storage-template.service.ts`
+- 通知服务: `server/src/services/notification.service.ts`
 - 枚举定义: `server/src/enum.ts`
 - 常量定义: `server/src/constants.ts`
