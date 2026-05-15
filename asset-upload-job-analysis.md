@@ -32,7 +32,38 @@ async intercept(context: ExecutionContext, next: CallHandler<any>) {
 }
 ```
 
-### 1.2 文件上传处理
+### 1.2 短路分支：重复上传命中校验流程
+
+这是上传流程中的**快速失败优化路径**，在文件真正上传到服务器之前就完成重复检测：
+
+```
+客户端上传请求 (携带 x-immich-checksum header)
+    ↓
+AuthGuard → 认证用户
+    ↓
+AssetUploadInterceptor 拦截
+    ├─ 从 header 中提取 SHA1 checksum
+    └─ 调用 getUploadAssetIdByChecksum(userId, checksum) 查询 DB
+    ↓
+┌─ 命中？─┐
+│  Yes    │  No ────> 继续执行 FileUploadInterceptor，进入正常上传流程
+│    ↓    │
+│  HTTP 200 OK 返回
+│  {
+│    status: "DUPLICATE",
+│    id: <existing-asset-id>
+│  }
+│    ↓
+│  流程结束（无文件写入、无作业排队）
+└─────────┘
+```
+
+**设计意图**:
+- 节省带宽：避免不必要的大文件传输
+- 节省计算资源：避免重复的文件处理、缩略图生成等
+- 快速响应：客户端可以立即知道文件已存在
+
+### 1.3 文件上传处理
 
 **文件路径**: `server/src/middleware/file-upload.interceptor.ts:97-137`
 
@@ -223,26 +254,133 @@ AssetGenerateThumbnails (source: 'upload') 完成
   └─ AssetUploadReadyV2 (含 EXIF 详情)
 ```
 
+#### 4.2.4 智能搜索完成后触发重复检测
+
+**文件路径**: `job.service.ts:218-222`
+
+```typescript
+case JobName.SmartSearch: {
+  if (item.data.source === 'upload') {
+    await this.jobRepository.queue({ name: JobName.AssetDetectDuplicates, data: item.data });
+  }
+  break;
+}
+```
+
+这是一个**条件触发**的后续作业，只有当智能搜索是由上传流程触发时（`source === 'upload'`），才会排队重复检测任务。
+
 ---
 
-## 5. 核心作业队列与任务
+## 5. 重复检测作业流程
 
-### 5.1 完整作业列表
+**文件路径**: `server/src/services/duplicate.service.ts:301-409`
 
-| 作业名称 (JobName) | 队列 (QueueName) | 职责 |
-|-------------------|-----------------|------|
-| `AssetExtractMetadata` | `MetadataExtraction` | 提取 EXIF、地理编码、标签、人脸等 |
-| `AssetGenerateThumbnails` | `ThumbnailGeneration` | 生成缩略图、预览图、WebP 格式 |
-| `AssetEncodeVideo` | `VideoConversion` | 视频转码为兼容格式 |
-| `AssetDetectFaces` | `FacialRecognition` | 人脸检测与识别 |
-| `SmartSearch` | `SmartSearch` | CLIP 图像特征提取 |
-| `Ocr` | `Ocr` | 图像文字识别 |
-| `SidecarCheck` | `Sidecar` | 检查 sidecar 文件变化 |
-| `SidecarWrite` | `Sidecar` | 写入元数据到 XMP sidecar |
-| `AssetDelete` | `BackgroundTask` | 资产删除清理 |
-| `PersonGenerateThumbnail` | `ThumbnailGeneration` | 生成人物头像 |
+### 5.1 作业信息
 
-### 5.2 队列并发控制
+| 属性 | 值 |
+|------|-----|
+| 作业名称 | `JobName.AssetDetectDuplicates` |
+| 队列名称 | `QueueName.DuplicateDetection` |
+| 触发时机 | SmartSearch 作业完成后，且 source === 'upload' |
+
+### 5.2 批量队列触发作业
+
+存在一个批量触发作业 `AssetDetectDuplicatesQueueAll`，用于全量扫描：
+
+```typescript
+@OnJob({ name: JobName.AssetDetectDuplicatesQueueAll, queue: QueueName.DuplicateDetection })
+async handleQueueSearchDuplicates({ force }) {
+  // 检查重复检测开关
+  if (!isDuplicateDetectionEnabled(machineLearning)) {
+    return JobStatus.Skipped;
+  }
+
+  // 流式遍历需要检测的资产，批量排队
+  for await (const asset of this.assetJobRepository.streamForSearchDuplicates(force)) {
+    jobs.push({ name: JobName.AssetDetectDuplicates, data: { id: asset.id } });
+    // 批量提交...
+  }
+}
+```
+
+### 5.3 单个重复检测作业处理流程
+
+```
+DuplicateDetection 队列接收任务 (AssetDetectDuplicates)
+    ↓
+前置检查，任一条件满足则 Skipped:
+  ├─ 重复检测配置未启用 → Skipped
+  ├─ 资产不存在 → Failed
+  ├─ 资产是堆栈成员 → Skipped
+  ├─ 资产可见性为 Hidden → Skipped
+  ├─ 资产可见性为 Locked → Skipped
+  └─ 缺少 CLIP 特征 embedding → Failed
+    ↓
+调用 duplicateRepository.search() 进行相似度搜索:
+  ├─ 参数: assetId, embedding, maxDistance, type, userIds
+  └─ 返回: 相似资产列表 (按相似度排序)
+    ↓
+┌─ 找到重复资产？─┐
+│  Yes            │  No (但 asset.duplicateId 存在)
+│    ↓            │    ↓
+│  updateDuplicates()│  清除 duplicateId 关联
+│  ├─ 合并现有重复组 │
+│  └─ 更新所有相关资产的 duplicateId
+│    ↓            │
+│  更新所有关联资产的 duplicatesDetectedAt 时间戳
+│    ↓
+│  任务完成 → JobStatus.Success
+└─────────────────┘
+```
+
+### 5.4 重复组合并逻辑
+
+```typescript
+private async updateDuplicates(asset, duplicateAssets): Promise<string[]> {
+  // 1. 收集所有命中的 duplicateId
+  const duplicateIds = [...new Set(duplicateAssets.filter(a => a.duplicateId).map(a => a.duplicateId))];
+
+  // 2. 确定目标重复组 ID
+  const targetDuplicateId = asset.duplicateId ?? duplicateIds.shift() ?? randomUUID();
+
+  // 3. 收集需要更新的资产 ID（排除已在目标组中的）
+  const assetIdsToUpdate = duplicateAssets
+    .filter(a => a.duplicateId !== targetDuplicateId)
+    .map(a => a.assetId);
+  assetIdsToUpdate.push(asset.id);
+
+  // 4. 合并重复组：将 sourceIds 合并到 targetId，关联所有 assetIdsToUpdate
+  await this.duplicateRepository.merge({
+    targetId: targetDuplicateId,
+    assetIds: assetIdsToUpdate,
+    sourceIds: duplicateIds,
+  });
+
+  return assetIdsToUpdate;
+}
+```
+
+---
+
+## 6. 核心作业队列与任务
+
+### 6.1 完整作业列表（更新版）
+
+| 作业名称 (JobName) | 队列 (QueueName) | 职责 | 触发源 |
+|-------------------|-----------------|------|--------|
+| `AssetExtractMetadata` | `MetadataExtraction` | 提取 EXIF、地理编码、标签、人脸等 | 资产创建 |
+| `AssetGenerateThumbnails` | `ThumbnailGeneration` | 生成缩略图、预览图、WebP 格式 | 元数据提取后 / 模板迁移 |
+| `SmartSearch` | `SmartSearch` | CLIP 图像特征提取 | 缩略图生成完成后 |
+| `AssetDetectDuplicates` | `DuplicateDetection` | 基于 embedding 的相似度重复检测 | SmartSearch 完成后（source=upload） |
+| `AssetDetectFaces` | `FacialRecognition` | 人脸检测与识别 | 缩略图生成完成后 |
+| `Ocr` | `Ocr` | 图像文字识别 | 缩略图生成完成后 |
+| `AssetEncodeVideo` | `VideoConversion` | 视频转码为兼容格式 | 缩略图生成完成后（仅视频） |
+| `SidecarCheck` | `Sidecar` | 检查 sidecar 文件变化 | 手动触发 / 定时 |
+| `SidecarWrite` | `Sidecar` | 写入元数据到 XMP sidecar | 标签更新 / 重复解决后 |
+| `AssetDelete` | `BackgroundTask` | 资产删除清理 | 手动删除 / 自动清理 |
+| `PersonGenerateThumbnail` | `ThumbnailGeneration` | 生成人物头像 | 人脸检测完成后 |
+
+### 6.2 队列并发控制
 
 **文件路径**: `job.repository.ts:108-116`
 
@@ -257,11 +395,11 @@ setConcurrency(queueName: QueueName, concurrency: number) {
 
 ---
 
-## 6. 作业仓库 (JobRepository) 详解
+## 7. 作业仓库 (JobRepository) 详解
 
 **文件路径**: `server/src/repositories/job.repository.ts`
 
-### 6.1 核心功能
+### 7.1 核心功能
 
 | 方法 | 功能 |
 |------|------|
@@ -273,7 +411,7 @@ setConcurrency(queueName: QueueName, concurrency: number) {
 | `getJobCounts()` | 获取队列统计 |
 | `waitForQueueCompletion()` | 等待队列处理完成 (测试用) |
 
-### 6.2 作业发现机制
+### 7.2 作业发现机制
 
 使用 `@OnJob()` 装饰器标记作业处理器：
 ```typescript
@@ -286,7 +424,7 @@ export const OnJob = (config: JobConfig) =>
 async handleMetadataExtraction(data: JobOf<JobName.AssetExtractMetadata>) { ... }
 ```
 
-### 6.3 作业选项 (JobOptions)
+### 7.3 作业选项 (JobOptions)
 
 部分作业有特殊排队选项：
 
@@ -299,15 +437,21 @@ async handleMetadataExtraction(data: JobOf<JobName.AssetExtractMetadata>) { ... 
 
 ---
 
-## 7. 完整上传到作业分发链路图
+## 8. 完整上传到作业分发链路图（更新版）
 
 ```
-客户端上传请求
+客户端上传请求 (可选携带 x-immich-checksum header)
     │
     ▼
 [HTTP 层]
     ├─ AuthGuard → 认证用户
-    ├─ AssetUploadInterceptor → 预检查重复 (按 checksum)
+    │
+    ├─ AssetUploadInterceptor
+    │   └─ 预检查 checksum 是否存在
+    │       ├─ 存在 ──> 短路返回 { status: DUPLICATE, id }
+    │       │           流程结束（无文件写入、无作业排队）
+    │       └─ 不存在 ──> 继续执行
+    │
     └─ FileUploadInterceptor → 接收文件，计算 SHA1
     │
     ▼
@@ -335,7 +479,7 @@ async handleMetadataExtraction(data: JobOf<JobName.AssetExtractMetadata>) { ... 
     │       ├─ 发出 AssetMetadataExtracted 事件
     │       └─ 更新 metadataExtractedAt
     │
-    ▼  注: 下一阶段由 thumbnail generation 触发 (非 metadata)
+    ▼  注: 下一阶段由 thumbnail generation 触发 (非 metadata 事件直接触发)
     │
     ├─ (StorageTemplateMigrationSingle)  ← 可选，如果启用了模板
     │   └─ source === 'upload' → 排队 AssetGenerateThumbnails
@@ -350,7 +494,7 @@ async handleMetadataExtraction(data: JobOf<JobName.AssetExtractMetadata>) { ... 
     │       └─ ✅ JobSuccess 触发 onDone()
     │           │
     │           ├─ 并行排队:
-    │           │   ├─ SmartSearch
+    │           │   ├─ SmartSearch (source: 'upload')
     │           │   ├─ AssetDetectFaces
     │           │   ├─ Ocr
     │           │   └─ (视频) AssetEncodeVideo
@@ -360,7 +504,17 @@ async handleMetadataExtraction(data: JobOf<JobName.AssetExtractMetadata>) { ... 
     │               └─ AssetUploadReadyV2
     │
     ├─ QueueName.SmartSearch
-    │   └─ 提取 CLIP 特征，用于语义搜索
+    │   └─ 提取 CLIP 图像特征 embedding
+    │       └─ ✅ onDone() 条件触发: source === 'upload'
+    │           └─ 排队: AssetDetectDuplicates
+    │
+    ├─ QueueName.DuplicateDetection
+    │   └─ AssetDetectDuplicates
+    │       ├─ 前置检查 (可见性、是否在堆栈中、embedding 存在)
+    │       ├─ 相似度搜索 (基于 CLIP embedding)
+    │       ├─ 如找到重复，合并到重复组或创建新组
+    │       ├─ 更新 assets.duplicateId 关联
+    │       └─ 更新 duplicatesDetectedAt 时间戳
     │
     ├─ QueueName.FacialRecognition
     │   └─ 检测人脸，聚类，识别人物
@@ -374,33 +528,37 @@ async handleMetadataExtraction(data: JobOf<JobName.AssetExtractMetadata>) { ... 
 
 ---
 
-## 8. 关键设计模式
+## 9. 关键设计模式
 
-### 8.1 事件驱动架构
+### 9.1 事件驱动架构
 
 - 使用 `EventRepository` 作为事件总线
 - `@OnEvent()` 装饰器订阅事件
 - 作业完成后通过事件触发后续作业链
 
-### 8.2 装饰器驱动的作业注册
+### 9.2 装饰器驱动的作业注册
 
 通过 `@OnJob()` 装饰器自动发现和注册作业处理器，无需手动注册。
 
-### 8.3 批量处理优化
+### 9.3 批量处理优化
 
 - `queueAll()` 支持批量排队，使用 `addBulk()` 提高性能
 - 作业按队列分组，统一批量提交
 
-### 8.4 幂等性设计
+### 9.4 幂等性设计
 
 - 关键作业使用 `jobId` 去重（如相册通知、模板迁移）
-- 重复检测基于 SHA1 校验和
+- 重复检测基于 SHA1 校验和（上传前）+ CLIP embedding（上传后）双重保障
+
+### 9.5 短路优化模式
+
+在上传流程入口处通过 checksum 快速检测重复，避免不必要的文件传输和处理，这是典型的**失败快速 (Fail Fast)** 设计模式。
 
 ---
 
-## 9. 错误处理与重试
+## 10. 错误处理与重试
 
-### 9.1 作业执行异常
+### 10.1 作业执行异常
 
 ```typescript
 // job.service.ts:58-61
@@ -415,7 +573,7 @@ try {
 }
 ```
 
-### 9.2 视频转码降级策略
+### 10.2 视频转码降级策略
 
 **文件路径**: `media.service.ts:616-642`
 
@@ -424,28 +582,44 @@ try {
 2. 尝试纯软件编码
 3. 仍失败则作业失败，由 BullMQ 重试机制处理
 
+### 10.3 重复检测降级处理
+
+**文件路径**: `duplicate.service.ts:328-383`
+
+重复检测作业在以下情况会优雅降级：
+- 重复检测功能未启用 → `Skipped`
+- 资产在堆栈中（避免重复检测同一组图像）→ `Skipped`
+- 资产可见性为 Hidden/Locked（隐私保护）→ `Skipped`
+- 缺少 embedding（SmartSearch 尚未完成）→ `Failed`（会重试）
+
 ---
 
-## 10. 性能考虑点
+## 11. 性能考虑点
 
-### 10.1 并发控制
+### 11.1 并发控制
 
 - 每个队列独立配置并发数
 - 元数据提取、缩略图生成、人脸识别等高 CPU 作业独立队列
 
-### 10.2 批量操作
+### 11.2 批量操作
 
 - 大规模作业（如库扫描）使用流式处理 + 批量排队
 - 分页大小: `JOBS_ASSET_PAGINATION_SIZE`
 
-### 10.3 优先级
+### 11.3 优先级
 
 - 人物缩略图生成使用高优先级 (`priority: 1`)
 - 上传流程中的作业按自然顺序执行
 
+### 11.4 重复检测性能优化
+
+- 相似度搜索使用向量数据库索引加速
+- 跳过 Hidden/Locked 资产，减少无效计算
+- 只比较同一用户、同一类型（图片/视频）的资产
+
 ---
 
-## 11. 涉及的主要文件
+## 12. 涉及的主要文件（更新版）
 
 | 文件 | 主要职责 |
 |------|---------|
@@ -454,20 +628,35 @@ try {
 | `server/src/services/asset-media.service.ts` | 资产上传核心逻辑 |
 | `server/src/services/metadata.service.ts` | 元数据提取作业 |
 | `server/src/services/media.service.ts` | 缩略图、视频处理作业 |
-| `server/src/services/job.service.ts` | 作业生命周期管理 |
+| `server/src/services/job.service.ts` | 作业生命周期管理、链式触发 |
+| `server/src/services/duplicate.service.ts` | 重复检测作业与重复组管理 |
 | `server/src/repositories/job.repository.ts` | 队列与作业管理 |
-| `server/src/middleware/asset-upload.interceptor.ts` | 重复检测拦截器 |
+| `server/src/middleware/asset-upload.interceptor.ts` | 上传前重复检测拦截器 |
 | `server/src/middleware/file-upload.interceptor.ts` | 文件上传处理 |
 
 ---
 
 ## 总结
 
-整个上传到作业分发流程采用了**事件驱动 + 队列链式处理**的架构设计：
+整个上传到作业分发流程采用了**事件驱动 + 队列链式处理**的架构设计，包含两个关键优化分支：
+
+### 两大核心流程分支
+
+1. **短路分支（快速路径）**：
+   - 触发点：AssetUploadInterceptor 在上传前检查 checksum
+   - 结果：命中重复时 HTTP 200 直接返回，无文件写入、无作业排队
+   - 价值：显著节省带宽、存储、计算资源
+
+2. **完整作业链分支（正常路径）**：
+   - `AssetExtractMetadata` → `AssetGenerateThumbnails` → `SmartSearch` → `AssetDetectDuplicates`
+   - 并行分支：人脸识别、OCR、视频转码
+
+### 关键设计要点
 
 1. **分层处理**: HTTP 层 → Service 层 → 队列层
-2. **作业链**: 元数据提取 → 缩略图生成 → (智能搜索/人脸识别/OCR/视频转码)
-3. **可扩展性**: 新增处理步骤只需添加作业处理器和 `onDone()` 中的链接逻辑
-4. **可靠性**: BullMQ 提供持久化、重试、失败管理
+2. **条件链式触发**: 作业间触发关系带有条件（如 `source === 'upload'`）
+3. **双重重复检测**: 上传前（SHA1 checksum）+ 上传后（CLIP 相似度）
+4. **可扩展性**: 新增处理步骤只需添加作业处理器和 `onDone()` 中的链接逻辑
+5. **可靠性**: BullMQ 提供持久化、重试、失败管理
 
-该设计确保了上传流程的高效性和可扩展性，能够支持大规模媒体文件处理。
+该设计确保了上传流程的高效性和可扩展性，能够支持大规模媒体文件处理，同时通过短路优化大幅提升了重复上传场景的性能。
