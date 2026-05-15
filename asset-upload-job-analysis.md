@@ -32,9 +32,9 @@ async intercept(context: ExecutionContext, next: CallHandler<any>) {
 }
 ```
 
-### 1.2 短路分支：重复上传命中校验流程
+### 1.2 短路分支一：前置 checksum 重复检测
 
-这是上传流程中的**快速失败优化路径**，在文件真正上传到服务器之前就完成重复检测：
+这是上传流程中的**第一级快速失败优化路径**，在文件真正上传到服务器之前就完成重复检测：
 
 ```
 客户端上传请求 (携带 x-immich-checksum header)
@@ -63,7 +63,116 @@ AssetUploadInterceptor 拦截
 - 节省计算资源：避免重复的文件处理、缩略图生成等
 - 快速响应：客户端可以立即知道文件已存在
 
-### 1.3 文件上传处理
+### 1.3 短路分支二：数据库 checksum 约束冲突兜底返回
+
+这是上传流程中的**第二级重复防护机制**，在文件已上传到服务器后、数据库层面的最后关口拦截重复。
+
+#### 1.3.1 数据库约束定义
+
+**文件路径**: `server/src/schema/migrations/1744910873969-InitialMigration.ts:441`
+
+```sql
+CREATE UNIQUE INDEX "UQ_assets_owner_checksum 
+ON "assets" ("ownerId", "checksum") 
+WHERE ("libraryId" IS NULL
+```
+
+**约束说明**:
+- 联合唯一索引：`(ownerId, checksum)`
+- 生效条件：仅对用户个人资产 (`libraryId IS NULL`)
+- 设计目的：确保同一用户不会有相同 checksum 的资产
+
+#### 1.3.2 触发时机与流程
+
+**文件路径**: `server/src/services/asset-media.service.ts:288-318`
+
+```
+FileUploadInterceptor 完成文件接收
+    ↓
+uploadAsset() 调用 create()
+    ├─ requireQuota() 检查配额
+    ├─ 处理 Live Photo 关联
+    └─ 调用 assetRepository.create()
+        └─ 执行 INSERT 语句
+        └─ 触发数据库唯一约束冲突 (UQ_assets_owner_checksum)
+    ↓
+异常抛出，进入 catch 异常
+    ↓
+handleUploadError() 捕获异常
+    ├─ 识别 isAssetChecksumConstraint(error)
+    │   └─ 判断 error.constraint_name === 'UQ_assets_owner_checksum'
+    ├─ 排队 FileDelete 作业：删除已写入磁盘的文件 + sidecar 文件
+    ├─ 调用 getUploadAssetIdByChecksum(userId, file.checksum) 查询已有资产 ID
+    ├─ 如是共享链接上传，将已有资产加入共享链接/相册
+    └─ 返回 { status: DUPLICATE, id: duplicateId }
+    ↓
+HTTP 200 OK 返回
+    ↓
+流程结束（无后续处理任务排队）
+```
+
+**关键代码** (`asset-media.service.ts:288-318`):
+```typescript
+private async handleUploadError(error, auth, file, sidecarFile) {
+  // 第一步：清理已上传的文件
+  await this.jobRepository.queue({
+    name: JobName.FileDelete,
+    data: { files: [file.originalPath, sidecarFile?.originalPath] },
+  });
+
+  // 第二步：识别为 checksum 约束冲突，走重复兜底逻辑
+  if (isAssetChecksumConstraint(error)) {
+    const duplicateId = await this.assetRepository.getUploadAssetIdByChecksum(
+      auth.user.id, file.checksum);
+    
+    if (auth.sharedLink) {
+      await this.addToSharedLink(auth.sharedLink, duplicateId);
+    }
+    
+    return { status: AssetMediaStatus.DUPLICATE, id: duplicateId };
+  }
+
+  throw error;
+}
+```
+
+#### 1.3.3 两条短路分支对比
+
+| 对比维度 | 分支一：前置 checksum 短路 | 分支二：约束冲突兜底 |
+|---------|----------------------|------------------|
+| **触发时机** | 文件接收前（Interceptor 层） | 文件接收后（Service 层） |
+| **触发条件** | 客户端携带 `x-immich-checksum` header | 客户端未传 header 或 header 不准确，但文件实际 checksum 重复 |
+| **发生阶段** | 无任何文件写入 | 文件已写入磁盘但尚未创建数据库记录 |
+| **数据库操作** | 1 次 SELECT 查询 | 1 次 INSERT 失败 + 1 次 SELECT 查询 |
+| **磁盘写入** | 无 | 有（后删除） |
+| **资源消耗** | 极低（仅网络 + 1 次 DB 查询） | 中等（文件 I/O + 数据库事务回滚） |
+| **排队作业** | 无 | 仅 `FileDelete`（清理已上传文件） |
+| **后续任务分发** | 不进入（在 interceptor 层就返回） | 不进入（异常在 `create()` 调用 `jobRepository.queue()` 之前抛出） |
+| **典型场景** | 移动客户端批量上传，客户端本地已计算好 checksum | Web 端上传、客户端未传 header 或网络异常重试 |
+
+#### 1.3.4 为何两条路径都不会进入后续任务分发链路
+
+**分支一（前置短路）不进入原因**：
+- 发生在 NestJS Interceptor 层，在调用 `uploadAsset()` 服务方法之前
+- `AssetUploadInterceptor.intercept()` 直接通过 `of()` 返回 Observable，不调用 `next.handle()`
+- 完全不会执行 Service 层的任何逻辑，包括 `create()` 方法中的作业排队
+
+**分支二（约束冲突兜底）不进入原因**：
+- `create()` 方法中作业排队发生在**最后一步**（第 361 行）：`await this.jobRepository.queue({ name: JobName.AssetExtractMetadata, ... })`
+- 而 `assetRepository.create()` 数据库插入发生在**第一步**（第 321 行）
+- 约束冲突异常在插入时抛出，直接跳转到 catch 块，不会执行到排队语句
+- 异常处理中唯一排队的是 `FileDelete` 清理作业，不属于资产处理任务链
+
+```typescript
+// create() 方法执行顺序
+private async create(ownerId, dto, file, sidecarFile) {
+  const asset = await this.assetRepository.create({...}); // ← 这里抛出异常
+  // ...
+  await this.jobRepository.queue({ name: JobName.AssetExtractMetadata, ... }); // ← 异常时不会执行到这里
+}
+```
+
+### 1.4 文件上传处理
 
 **文件路径**: `server/src/middleware/file-upload.interceptor.ts:97-137`
 
@@ -83,10 +192,10 @@ AssetUploadInterceptor 拦截
 
 **文件路径**: `server/src/services/asset-media.service.ts:320-364`
 
-### 2.1 核心创建步骤
+### 2.1 核心创建步骤（正常流程，非短路）
 
 ```
-上传请求
+上传请求（已通过拦截器检查）
     ↓
 检查配额 (requireQuota)
     ↓
@@ -362,9 +471,19 @@ private async updateDuplicates(asset, duplicateAssets): Promise<string[]> {
 
 ---
 
-## 6. 核心作业队列与任务
+## 6. 三级重复检测机制总览
 
-### 6.1 完整作业列表（更新版）
+| 检测层级 | 触发位置 | 检测方式 | 失败后行为 |
+|---------|--------|---------|---------|
+| **第一级**：前置短路 | Interceptor 层 | HTTP Header checksum 预查 | 直接返回，无文件写入 |
+| **第二级**：约束兜底 | Service 层 | 数据库唯一索引 | 回滚事务、删除已上传文件、返回重复 ID |
+| **第三级**：相似度检测 | 后台作业层 | CLIP embedding 向量相似度 | 标记重复组、支持后续去重操作 |
+
+---
+
+## 7. 核心作业队列与任务
+
+### 7.1 完整作业列表（更新版）
 
 | 作业名称 (JobName) | 队列 (QueueName) | 职责 | 触发源 |
 |-------------------|-----------------|------|--------|
@@ -375,12 +494,13 @@ private async updateDuplicates(asset, duplicateAssets): Promise<string[]> {
 | `AssetDetectFaces` | `FacialRecognition` | 人脸检测与识别 | 缩略图生成完成后 |
 | `Ocr` | `Ocr` | 图像文字识别 | 缩略图生成完成后 |
 | `AssetEncodeVideo` | `VideoConversion` | 视频转码为兼容格式 | 缩略图生成完成后（仅视频） |
+| `FileDelete` | `BackgroundTask` | 文件清理（上传失败/重复时删除临时文件） | handleUploadError 异常处理 |
 | `SidecarCheck` | `Sidecar` | 检查 sidecar 文件变化 | 手动触发 / 定时 |
 | `SidecarWrite` | `Sidecar` | 写入元数据到 XMP sidecar | 标签更新 / 重复解决后 |
 | `AssetDelete` | `BackgroundTask` | 资产删除清理 | 手动删除 / 自动清理 |
 | `PersonGenerateThumbnail` | `ThumbnailGeneration` | 生成人物头像 | 人脸检测完成后 |
 
-### 6.2 队列并发控制
+### 7.2 队列并发控制
 
 **文件路径**: `job.repository.ts:108-116`
 
@@ -395,11 +515,11 @@ setConcurrency(queueName: QueueName, concurrency: number) {
 
 ---
 
-## 7. 作业仓库 (JobRepository) 详解
+## 8. 作业仓库 (JobRepository) 详解
 
 **文件路径**: `server/src/repositories/job.repository.ts`
 
-### 7.1 核心功能
+### 8.1 核心功能
 
 | 方法 | 功能 |
 |------|------|
@@ -411,7 +531,7 @@ setConcurrency(queueName: QueueName, concurrency: number) {
 | `getJobCounts()` | 获取队列统计 |
 | `waitForQueueCompletion()` | 等待队列处理完成 (测试用) |
 
-### 7.2 作业发现机制
+### 8.2 作业发现机制
 
 使用 `@OnJob()` 装饰器标记作业处理器：
 ```typescript
@@ -424,7 +544,7 @@ export const OnJob = (config: JobConfig) =>
 async handleMetadataExtraction(data: JobOf<JobName.AssetExtractMetadata>) { ... }
 ```
 
-### 7.3 作业选项 (JobOptions)
+### 8.3 作业选项 (JobOptions)
 
 部分作业有特殊排队选项：
 
@@ -437,7 +557,7 @@ async handleMetadataExtraction(data: JobOf<JobName.AssetExtractMetadata>) { ... 
 
 ---
 
-## 8. 完整上传到作业分发链路图（更新版）
+## 9. 完整上传到作业分发链路图（更新版）
 
 ```
 客户端上传请求 (可选携带 x-immich-checksum header)
@@ -448,18 +568,31 @@ async handleMetadataExtraction(data: JobOf<JobName.AssetExtractMetadata>) { ... 
     │
     ├─ AssetUploadInterceptor
     │   └─ 预检查 checksum 是否存在
-    │       ├─ 存在 ──> 短路返回 { status: DUPLICATE, id }
+    │       ├─ █ 存在 ──> 【短路分支一】
+    │       │           直接返回 { status: DUPLICATE, id }
     │       │           流程结束（无文件写入、无作业排队）
     │       └─ 不存在 ──> 继续执行
     │
     └─ FileUploadInterceptor → 接收文件，计算 SHA1
     │
     ▼
-[Service 层: AssetMediaService]
-    ├─ uploadAsset()
-    │   ├─ 检查用户配额
-    │   ├─ 处理 Live Photo 关联
-    │   ├─ 创建资产 DB 记录
+[Service 层: AssetMediaService.uploadAsset()
+    │
+    ├─ 检查用户配额
+    ├─ 处理 Live Photo 关联
+    │
+    └─ 调用 create() 创建资产
+    │   ├─ assetRepository.create() 执行 INSERT
+    │   │   └─ █ checksum 约束冲突？
+    │   │       ├─ Yes ──> 【短路分支二】
+    │   │       │       抛出异常 → handleUploadError()
+    │   │       │           ├─ 排队 FileDelete 清理文件
+    │   │       │           ├─ 查询已有资产 ID
+    │   │       │           ├─ 加入共享链接（如需要）
+    │   │       │           └─ 返回 { status: DUPLICATE, id }
+    │   │       │           流程结束（无后续处理任务排队）
+    │   │       └─ No ──> 数据库插入成功，继续执行
+    │   │
     │   ├─ 处理 metadata/sidecar
     │   ├─ 更新文件时间戳
     │   ├─ 初始化 EXIF (fileSizeInByte)
@@ -528,37 +661,42 @@ async handleMetadataExtraction(data: JobOf<JobName.AssetExtractMetadata>) { ... 
 
 ---
 
-## 9. 关键设计模式
+## 10. 关键设计模式
 
-### 9.1 事件驱动架构
+### 10.1 事件驱动架构
 
 - 使用 `EventRepository` 作为事件总线
 - `@OnEvent()` 装饰器订阅事件
 - 作业完成后通过事件触发后续作业链
 
-### 9.2 装饰器驱动的作业注册
+### 10.2 装饰器驱动的作业注册
 
 通过 `@OnJob()` 装饰器自动发现和注册作业处理器，无需手动注册。
 
-### 9.3 批量处理优化
+### 10.3 批量处理优化
 
 - `queueAll()` 支持批量排队，使用 `addBulk()` 提高性能
 - 作业按队列分组，统一批量提交
 
-### 9.4 幂等性设计
+### 10.4 幂等性设计
 
 - 关键作业使用 `jobId` 去重（如相册通知、模板迁移）
 - 重复检测基于 SHA1 校验和（上传前）+ CLIP embedding（上传后）双重保障
+- 数据库唯一约束作为最后防线
 
-### 9.5 短路优化模式
+### 10.5 短路优化模式
 
 在上传流程入口处通过 checksum 快速检测重复，避免不必要的文件传输和处理，这是典型的**失败快速 (Fail Fast)** 设计模式。
 
+- **双重短路防护**：
+  1. 网络层面：Interceptor 预检查，零成本快速失败
+  2. 数据层面：数据库唯一约束兜底，确保数据一致性
+
 ---
 
-## 10. 错误处理与重试
+## 11. 错误处理与重试
 
-### 10.1 作业执行异常
+### 11.1 作业执行异常
 
 ```typescript
 // job.service.ts:58-61
@@ -573,7 +711,7 @@ try {
 }
 ```
 
-### 10.2 视频转码降级策略
+### 11.2 视频转码降级策略
 
 **文件路径**: `media.service.ts:616-642`
 
@@ -582,7 +720,7 @@ try {
 2. 尝试纯软件编码
 3. 仍失败则作业失败，由 BullMQ 重试机制处理
 
-### 10.3 重复检测降级处理
+### 11.3 重复检测降级处理
 
 **文件路径**: `duplicate.service.ts:328-383`
 
@@ -594,69 +732,78 @@ try {
 
 ---
 
-## 11. 性能考虑点
+## 12. 性能考虑点
 
-### 11.1 并发控制
+### 12.1 并发控制
 
 - 每个队列独立配置并发数
 - 元数据提取、缩略图生成、人脸识别等高 CPU 作业独立队列
 
-### 11.2 批量操作
+### 12.2 批量操作
 
 - 大规模作业（如库扫描）使用流式处理 + 批量排队
 - 分页大小: `JOBS_ASSET_PAGINATION_SIZE`
 
-### 11.3 优先级
+### 12.3 优先级
 
 - 人物缩略图生成使用高优先级 (`priority: 1`)
 - 上传流程中的作业按自然顺序执行
 
-### 11.4 重复检测性能优化
+### 12.4 重复检测性能优化
 
 - 相似度搜索使用向量数据库索引加速
 - 跳过 Hidden/Locked 资产，减少无效计算
 - 只比较同一用户、同一类型（图片/视频）的资产
+- 两级短路检测优先，避免 99% 以上重复文件到达第三级计算
 
 ---
 
-## 12. 涉及的主要文件（更新版）
+## 13. 涉及的主要文件（更新版）
 
 | 文件 | 主要职责 |
 |------|---------|
 | `server/src/controllers/asset-media.controller.ts` | 上传 API 端点 |
 | `server/src/controllers/asset.controller.ts` | 资产管理 API |
-| `server/src/services/asset-media.service.ts` | 资产上传核心逻辑 |
+| `server/src/services/asset-media.service.ts` | 资产上传核心逻辑、错误处理、短路兜底 |
 | `server/src/services/metadata.service.ts` | 元数据提取作业 |
 | `server/src/services/media.service.ts` | 缩略图、视频处理作业 |
 | `server/src/services/job.service.ts` | 作业生命周期管理、链式触发 |
 | `server/src/services/duplicate.service.ts` | 重复检测作业与重复组管理 |
 | `server/src/repositories/job.repository.ts` | 队列与作业管理 |
-| `server/src/middleware/asset-upload.interceptor.ts` | 上传前重复检测拦截器 |
+| `server/src/middleware/asset-upload.interceptor.ts` | 上传前重复检测拦截器（第一级短路） |
 | `server/src/middleware/file-upload.interceptor.ts` | 文件上传处理 |
+| `server/src/utils/database.ts` | 数据库约束定义与检测函数 |
 
 ---
 
 ## 总结
 
-整个上传到作业分发流程采用了**事件驱动 + 队列链式处理**的架构设计，包含两个关键优化分支：
+整个上传到作业分发流程采用了**事件驱动 + 队列链式处理**的架构设计，包含**三层重复防护机制**：
 
-### 两大核心流程分支
+### 两大核心流程分支 + 三级重复防护
 
-1. **短路分支（快速路径）**：
-   - 触发点：AssetUploadInterceptor 在上传前检查 checksum
-   - 结果：命中重复时 HTTP 200 直接返回，无文件写入、无作业排队
-   - 价值：显著节省带宽、存储、计算资源
+#### 1. 两大短路分支（快速路径）
 
-2. **完整作业链分支（正常路径）**：
-   - `AssetExtractMetadata` → `AssetGenerateThumbnails` → `SmartSearch` → `AssetDetectDuplicates`
-   - 并行分支：人脸识别、OCR、视频转码
+| 分支 | 触发层 | 触发条件 | 资源消耗 | 是否进入任务链 |
+|-----|--------|---------|---------|---------------|
+| **前置 checksum 短路** | Interceptor 层 | 客户端传 header 且 DB 命中 | 极低（仅 1 次 SELECT） | ❌ 不进入（在 Service 调用前返回） |
+| **约束冲突兜底** | Service 层 | 数据库唯一索引冲突 | 中等（文件 I/O + 事务回滚） | ❌ 不进入（异常在排队前抛出） |
+
+#### 2. 完整作业链分支（正常路径）
+
+仅当两级短路都未命中时，进入完整处理链：
+```
+AssetExtractMetadata → AssetGenerateThumbnails → SmartSearch → AssetDetectDuplicates
+并行分支：人脸识别、OCR、视频转码
+```
 
 ### 关键设计要点
 
 1. **分层处理**: HTTP 层 → Service 层 → 队列层
 2. **条件链式触发**: 作业间触发关系带有条件（如 `source === 'upload'`）
-3. **双重重复检测**: 上传前（SHA1 checksum）+ 上传后（CLIP 相似度）
+3. **三重重复检测**: 上传前（Header checksum）→ 上传后（DB 约束）→ 后台（CLIP 相似度）
 4. **可扩展性**: 新增处理步骤只需添加作业处理器和 `onDone()` 中的链接逻辑
 5. **可靠性**: BullMQ 提供持久化、重试、失败管理
+6. **失败快速**: 两级短路优化，在流程最前端拦截 99% 重复上传
 
-该设计确保了上传流程的高效性和可扩展性，能够支持大规模媒体文件处理，同时通过短路优化大幅提升了重复上传场景的性能。
+该设计确保了上传流程的高效性和可扩展性，能够支持大规模媒体文件处理，同时通过多层次短路优化大幅提升了重复上传场景的性能。
