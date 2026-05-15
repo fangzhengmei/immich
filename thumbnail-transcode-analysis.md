@@ -508,15 +508,18 @@ private async applyMotionPhotos(asset, tags, dates, stats) {
 
 ### 6.2 后续任务处理
 
-提取后的视频资产通过**正常流程**处理，无特殊队列联动：
+提取后的视频资产**有特殊队列联动**，会**直接入队视频转码**，同时也会通过正常流程处理：
 
 ```
-Motion Photo 视频资产流程:
+Motion Photo 视频资产完整流程:
 1. 创建视频资产 (Hidden 状态)
-2. 元数据提取 (AssetExtractMetadata)
-3. → StorageTemplateMigrationSingle
-4. → AssetGenerateThumbnails (source=upload)
-5. → (如需) AssetEncodeVideo
+2. ⚠️ 视频写入磁盘后 (文件不存在时)
+   ├─ 同步调用: handleMetadataExtraction({ id: motionAsset.id })
+   └─ 直接入队: queue({ name: AssetEncodeVideo, data: { id: motionAsset.id } })
+3. 正常流程后续:
+   ├─ StorageTemplateMigrationSingle (串行队列)
+   └─ AssetGenerateThumbnails
+      └─ 通常不会再次触发视频转码（因为已直接入队）
 ```
 
 ---
@@ -628,7 +631,7 @@ nightlyTasks: {
 - ✅ `AssetEditThumbnailGeneration` 完成后**不触发**后续任务链（SmartSearch、人脸检测、OCR、视频转码），仅发送 WebSocket 通知
 - ✅ `StorageTemplateMigrationSingle` 所属队列为 `QueueName.StorageTemplateMigration`，是**串行执行队列**
 - ✅ `PersonGenerateThumbnail` 具有高优先级 (`priority: 1`)，完成后仅发送 WebSocket 通知，不触发后续任务
-- ✅ Motion Photo/Live Photo 提取的视频资产通过正常流程处理，无特殊队列联动
+- ✅ ⚠️ Motion Photo/Live Photo 提取的视频资产**会直接入队视频转码**：`queue({ name: JobName.AssetEncodeVideo, data: { id: motionAsset.id } })`，这是视频转码的第 4 个独立触发入口
 
 ### 9.3 关键文件位置
 - 队列服务: `server/src/services/queue.service.ts`
