@@ -81,6 +81,14 @@ private isConcurrentQueue(name: QueueName): name is ConcurrentQueueName {
 │  │       → AssetEditThumbnail-    │  │       → AssetEncodeVideo     │         │
 │  │         Generation           │  │                               │         │
 │  └─────────────────────────────────┘  └─────────────────────────────────┘         │
+│                                                                                     │
+│  ┌───────────────────────────────────────────────────────────────────────────┐         │
+│  │  7. Motion Photo 视频提取直接触发 ⚠️                                        │         │
+│  │     - metadata.service 检测 Motion Photo                                   │         │
+│  │     - 提取内嵌视频 → 创建独立视频资产                                      │         │
+│  │     - handleMetadataExtraction({ id: motionAsset.id })                   │         │
+│  │     - 直接 queue({ name: AssetEncodeVideo, data: { id: motionAsset.id } })│         │
+│  └───────────────────────────────────────────────────────────────────────────┘         │
 └─────────────────────────────────────────────────────────────────────────────────────┘
                                     ↓
 ┌─────────────────────────────────────────────────────────────────────────────────────┐
