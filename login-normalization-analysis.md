@@ -183,14 +183,128 @@ if (duplicate && duplicate.id !== auth.user.id) {
 - Claim 仅在用户创建时使用，后续不会同步更新
 - 第一个注册的用户必须是管理员
 
-### 5.2 禁用自动注册
+### 5.2 首次登录失败分支分析
+
+#### 5.2.1 OAuth 资料缺少 email
+
+**触发条件**：
+- OAuth/OIDC 返回的 profile 中不包含 `email` 字段
+- 或 `email` 字段为空字符串
+
+**代码位置**：`server/src/services/auth.service.ts:341-343`
+
+```typescript
+if (!normalizedEmail) {
+  throw new BadRequestException('OAuth profile does not have an email address');
+}
+```
+
+**处理逻辑**：
+1. `normalizedEmail` 来自 `profile.email ? profile.email.trim().toLowerCase() : undefined`
+2. 若 `normalizedEmail` 为 `undefined` 或空字符串，直接抛出异常
+3. 无论 `autoRegister` 开启与否，均无法完成登录或注册
+
+**返回结果**：
+- HTTP 状态码：`400 Bad Request`
+- 错误消息：`OAuth profile does not have an email address`
+- 用户无法登录，需要在 IdP 端配置 email 字段映射
+
+**注意**：即使 IdP 的 scope 包含 `email`，也可能因为用户未验证邮箱等原因导致 `email` 字段为空。
+
+---
+
+#### 5.2.2 autoRegister 关闭
+
+**触发条件**：
+- `oauth.autoRegister` 配置为 `false`
+- 通过 `oauthId` 未找到用户
+- 通过 `email` 也未找到用户（或 profile 无 email）
+
+**代码位置**：`server/src/services/auth.service.ts:333-339`
+
+```typescript
+if (!user) {
+  if (!autoRegister) {
+    this.logger.warn(
+      `Unable to register ${profile.sub}/${normalizedEmail || '(no email)'}. User does not exist and auto registering is disabled. To enable set OAuth Auto Register to true in admin settings.`,
+    );
+    throw new BadRequestException('OAuth authentication failed');
+  }
+}
+```
+
+**处理逻辑**：
+1. 经过 `oauthId` 查找和 `email` 自动关联后，`user` 仍为 `undefined`
+2. 检查 `autoRegister` 配置，若为 `false` 则拒绝
+3. 记录警告日志，包含 `profile.sub` 和 `email`（用于排查）
+
+**返回结果**：
+- HTTP 状态码：`400 Bad Request`
+- 错误消息：`OAuth authentication failed`
+- 服务端日志包含详细原因：`User does not exist and auto registering is disabled`
+
+**解决方案**：
+- 管理员预先在 Immich 中创建用户（匹配邮箱）
+- 或开启 `autoRegister` 允许自动注册
+- 或用户通过密码登录后手动关联 OAuth 账号
+
+---
+
+#### 5.2.3 首个用户非 admin
+
+**触发条件**：
+- Immich 系统中尚无任何用户（`userRepository.getAdmin()` 返回 `null`）
+- 首次注册的用户 `isAdmin` 为 `false`
+
+**代码位置**：`server/src/services/base.service.ts:225-230`
+
+```typescript
+if (!dto.isAdmin) {
+  const localAdmin = await this.userRepository.getAdmin();
+  if (!localAdmin) {
+    throw new BadRequestException('The first registered account must the administrator.');
+  }
+}
+```
+
+**处理逻辑**：
+1. `createUser()` 被调用时检查 `dto.isAdmin`
+2. 若非管理员，查询系统中是否已存在管理员
+3. 若无管理员，则拒绝创建
+
+**常见场景**：
+- 通过 OAuth 自动注册首个用户，但 `roleClaim` 未返回 `admin`
+- 普通用户通过 API 注册（绕过管理员）
+
+**返回结果**：
+- HTTP 状态码：`400 Bad Request`
+- 错误消息：`The first registered account must the administrator.`
+
+**解决方案**：
+- 在 IdP 中为首个用户配置 `roleClaim`（如 `immich_role=admin`）
+- 或先通过 `/auth/admin-signup` 手动创建管理员
+- 或临时修改 OAuth 配置，让首个用户的 `roleClaim` 返回 `admin`
+
+---
+
+#### 5.2.4 其他首次登录失败场景
+
+| 失败场景 | 触发条件 | 错误消息 | 处理方式 |
+|----------|----------|----------|----------|
+| OAuth 未启用 | `oauth.enabled = false` | `OAuth is not enabled` | 在管理后台启用 OAuth |
+| State 参数缺失 | Cookie 中无 OAuth state | `OAuth state is missing` | 检查 OAuth 发起流程 |
+| PKCE verifier 缺失 | Cookie 中无 code_verifier | `OAuth code verifier is missing` | 检查 OAuth 发起流程 |
+| Token 验证失败 | OAuth token 无效或过期 | `OAuth login failed` | 重新发起 OAuth 登录 |
+| 邮箱已被占用 | 创建用户时邮箱已存在 | `Email is not available` | 使用现有账号登录或联系管理员 |
+
+### 5.3 禁用自动注册
 
 当 `autoRegister` 为 `false` 时：
 - 未注册的 OAuth 用户登录失败
 - 错误信息：`User does not exist and auto registering is disabled`
 - 管理员需预先创建用户（通过 API 或管理界面），用户登录时通过邮箱自动关联
 
-### 5.3 密码登录首次注册
+### 5.4 密码登录首次注册
 
 仅管理员可通过 `/auth/admin-signup` 注册首个管理员账户，普通用户需由管理员创建。
 
