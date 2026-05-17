@@ -32,10 +32,49 @@ date_trunc('MONTH', "localDateTime" AT TIME ZONE 'UTC') AT TIME ZONE 'UTC'
 
 ### 2.2 分桶 API
 
-| 端点 | 用途 | 返回值 |
-|------|------|--------|
-| `GET /timeline/buckets` | 获取所有时间桶列表 | `[{ timeBucket: "2024-01-01", count: 42 }]` |
-| `GET /timeline/bucket/{timeBucket}` | 获取单个桶内的资产详情 | 资产属性数组（id、ratio、thumbhash 等） |
+**重要说明**：两个端点都使用 **查询参数（Query Parameter）** 传递 `timeBucket`，而非路径参数。
+
+| 端点 | 用途 | 参数 | 返回值 |
+|------|------|------|--------|
+| `GET /timeline/buckets` | 获取所有时间桶列表 | 筛选、排序参数 | `[{ timeBucket: "2024-01-01", count: 42 }]` |
+| `GET /timeline/bucket` | 获取单个桶内的资产详情 | `?timeBucket=2024-01-01` + 其他参数 | 资产属性数组（id、ratio、thumbhash 等） |
+
+**控制器实现**（`timeline.controller.ts:26-37`）：
+```typescript
+@Get('bucket')
+getTimeBucket(@Auth() auth: AuthDto, @Query() dto: TimeBucketAssetDto) {
+  return this.service.getTimeBucket(auth, dto);
+}
+```
+
+### 2.3 TimeBucket 参数特殊处理
+
+**前导正负号清理**是一个关键的隐式行为，实现于 `asset.repository.ts:820`：
+
+```typescript
+.where(truncatedDate(options.orderBy), '=', timeBucket.replace(/^[+-]/, ''))
+```
+
+**处理规则**：
+- 正则表达式 `/^[+-]/` 会移除 `timeBucket` 字符串开头的 `+` 或 `-` 符号
+- 例如：`"+2024-01-01"` → `"2024-01-01"`，`"-0001-01-01"` → `"0001-01-01"`
+- 仅移除开头的单个正负号，后续字符不受影响
+
+**对分页结果的影响**：
+
+1. **公元前日期处理**：
+   - 理论上 ISO 8601 格式中公元前年份以 `-` 开头（如 `-0001-01-01` 表示公元前 1 年）
+   - 但由于前导 `-` 会被移除，`"-0001-01-01"` 会被当作 `"0001-01-01"`（公元 1 年）处理
+   - **结论**：当前实现无法正确查询公元前的资产
+
+2. **异常输入容错**：
+   - 意外带 `+` 号的参数（如 `"+2024-01-01"`）仍能正确匹配
+   - 这提供了一定的输入容错性，但也隐藏了潜在的客户端格式错误
+
+3. **分页一致性**：
+   - `getTimeBuckets` 返回的 `timeBucket` 字段不带正负号（格式化为 `YYYY-MM-DD`）
+   - 因此前端使用返回值作为参数调用 `getTimeBucket` 时不会触发符号清理
+   - 只有当客户端手动构造带符号的 timeBucket 时才会受此行为影响
 
 ### 2.3 分桶查询流程
 
