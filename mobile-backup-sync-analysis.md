@@ -1290,3 +1290,5 @@ WebSocket 批事件丢失
 | 同步流落库 | `sync_stream.repository.dart` | 196-272 |
 | 防抖器实现 | `debounce.dart` | 1-64 |
 | WebSocket 并发任务控制 | `background_sync.dart` | 189-227 |
+| 编辑事件处理（无防抖） | `websocket.provider.dart` | 182-188 |
+| 编辑事件落库 | `sync_stream.service.dart` | 414-487 |
