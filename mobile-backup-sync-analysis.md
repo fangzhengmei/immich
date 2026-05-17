@@ -557,7 +557,163 @@ Future<void> handleWsAssetUploadReadyV1Batch(List<dynamic> batchData) async {
 | `onConflict: DoUpdate` | `sync_stream.repository.dart:215` | 重复写入时更新而非报错 |
 | 全量同步兜底 | `background_sync.dart:160-187` | 应用启动时补全所有缺失数据 |
 
-### 5.10 缺口总结
+### 5.10 编辑事件与上传批事件的互相阻塞分析
+
+#### 5.10.1 共用并发门闩的设计
+
+**编辑事件处理路径**（无防抖，直接执行） (`websocket.provider.dart:182-188`):
+```dart
+void _handleSyncAssetEditReadyV1(dynamic data) {
+  unawaited(_ref.read(backgroundSyncProvider).syncWebsocketEditV1(data));
+}
+
+void _handleSyncAssetEditReadyV2(dynamic data) {
+  unawaited(_ref.read(backgroundSyncProvider).syncWebsocketEditV2(data));
+}
+```
+
+**关键发现**：编辑事件（AssetEditReadyV1/V2）**没有防抖机制**，收到后立即调用 `syncWebsocketEditV1/V2()`。
+
+**共用并发门闩** (`background_sync.dart:189-227`):
+```dart
+Cancelable<void>? _syncWebsocketTask;  // ⚠️ 所有事件类型共享同一个任务变量！
+
+// 上传批事件 V1
+Future<void> syncWebsocketBatchV1(List<dynamic> batchData) {
+  if (_syncWebsocketTask != null) {
+    return _syncWebsocketTask!.future;  // 有任务在执行，直接丢弃新数据
+  }
+  _syncWebsocketTask = _handleWsAssetUploadReadyV1Batch(batchData);
+  return _syncWebsocketTask!.whenComplete(() {
+    _syncWebsocketTask = null;
+  });
+}
+
+// 上传批事件 V2
+Future<void> syncWebsocketBatchV2(List<dynamic> batchData) {
+  if (_syncWebsocketTask != null) {
+    return _syncWebsocketTask!.future;  // 有任务在执行，直接丢弃新数据
+  }
+  _syncWebsocketTask = _handleWsAssetUploadReadyV2Batch(batchData);
+  return _syncWebsocketTask!.whenComplete(() {
+    _syncWebsocketTask = null;
+  });
+}
+
+// 编辑事件 V1
+Future<void> syncWebsocketEditV1(dynamic data) {
+  if (_syncWebsocketTask != null) {
+    return _syncWebsocketTask!.future;  // 有任务在执行，直接丢弃新数据
+  }
+  _syncWebsocketTask = _handleWsAssetEditReadyV1(data);
+  return _syncWebsocketTask!.whenComplete(() {
+    _syncWebsocketTask = null;
+  });
+}
+
+// 编辑事件 V2
+Future<void> syncWebsocketEditV2(dynamic data) {
+  if (_syncWebsocketTask != null) {
+    return _syncWebsocketTask!.future;  // 有任务在执行，直接丢弃新数据
+  }
+  _syncWebsocketTask = _handleWsAssetEditReadyV2(data);
+  return _syncWebsocketTask!.whenComplete(() {
+    _syncWebsocketTask = null;
+  });
+}
+```
+
+**核心问题**：
+1. **单个任务变量**：`_syncWebsocketTask` 被所有 4 个事件类型（上传 V1/V2、编辑 V1/V2）共享
+2. **直接丢弃策略**：`_syncWebsocketTask != null` 时，新数据被直接丢弃，无队列、无延迟消费
+3. **编辑事件无防抖**：编辑事件高频到达时更容易触发冲突
+
+#### 5.10.2 时序 1：编辑事件在先，上传批事件在后
+
+```
+时序图：
+T0: 编辑事件 E1 到达 → syncWebsocketEditV1(E1)
+    → _syncWebsocketTask == null
+    → _syncWebsocketTask = futureEdit(E1)
+    → 开始在 Isolate 中执行编辑操作（更新 remote_asset_entity）
+
+T1: (100ms 后) 上传批事件 U1 防抖触发 → syncWebsocketBatchV1([A,B,C])
+    → 检测到 _syncWebsocketTask != null (futureEdit 仍在执行)
+    → 直接返回 futureEdit，**丢弃 [A,B,C]**
+    → _batchedAssetUploadReady 已被 clear()
+
+T2: futureEdit(E1) 完成 → _syncWebsocketTask = null
+
+结果：
+- ✅ 编辑事件 E1 成功执行
+- ❌ 上传批事件 [A,B,C] 被永久丢弃
+- ❌ 无日志、无重试
+```
+
+**实际结果**：上传批事件被**丢弃**，不是延迟消费。
+
+#### 5.10.3 时序 2：上传批事件在先，编辑事件在后
+
+```
+时序图：
+T0: 上传批事件 U1 防抖触发 → syncWebsocketBatchV1([A,B,C])
+    → _syncWebsocketTask == null
+    → _syncWebsocketTask = futureBatch([A,B,C])
+    → 开始在 Isolate 中执行批量插入（可能有 100+ 条记录，耗时较长）
+
+T1: (100ms 后) 编辑事件 E1 到达 → syncWebsocketEditV1(E1)
+    → 检测到 _syncWebsocketTask != null (futureBatch 仍在执行)
+    → 直接返回 futureBatch，**丢弃 E1**
+
+T2: futureBatch([A,B,C]) 完成 → _syncWebsocketTask = null
+
+结果：
+- ✅ 上传批事件 [A,B,C] 成功执行
+- ❌ 编辑事件 E1 被永久丢失
+- ❌ 用户在 Web 端修改的元数据（如标题、描述、地理位置）不会同步到移动端
+```
+
+**实际结果**：编辑事件被**丢弃**，不是延迟消费。
+
+#### 5.10.4 时序 3：高频编辑事件连续到达
+
+```
+时序图：
+T0: 编辑事件 E1 到达 → syncWebsocketEditV1(E1)
+    → _syncWebsocketTask = futureEdit(E1)
+
+T1: (50ms 后) 编辑事件 E2 到达 → syncWebsocketEditV1(E2)
+    → _syncWebsocketTask != null
+    → 直接返回 futureEdit(E1)，**丢弃 E2**
+
+T2: (50ms 后) 编辑事件 E3 到达 → syncWebsocketEditV1(E3)
+    → _syncWebsocketTask != null
+    → 直接返回 futureEdit(E1)，**丢弃 E3**
+
+T3: futureEdit(E1) 完成 → _syncWebsocketTask = null
+
+结果：
+- ✅ E1 成功执行
+- ❌ E2、E3 被永久丢失
+- ❌ 用户的连续编辑操作只有第一个生效
+```
+
+**实际结果**：后续编辑事件被**丢弃**。
+
+### 5.11 触发条件矩阵
+
+| 触发场景 | 先到达事件 | 后到达事件 | 实际结果 | 现有保护点 | 缺口 | 对失败恢复的影响 | 对最终一致性的影响 |
+|---------|-----------|-----------|---------|-----------|------|-----------------|------------------|
+| **场景 1**：上一批未完成 | 上传批 V1 | 上传批 V1 | ❌ 新批被丢弃 | ✅ 防止并发写入数据库 | ❌ 新数据静默丢失 | 无影响（全量同步兜底） | 不一致直到全量同步 |
+| **场景 2**：上一批未完成 | 上传批 V1 | 上传批 V2 | ❌ 新批被丢弃 | ✅ 防止并发写入数据库 | ❌ V1/V2 共享任务变量 | 无影响（全量同步兜底） | 不一致直到全量同步 |
+| **场景 3**：交替到达 | 上传批 V1 | 编辑 V1 | ❌ 编辑被丢弃 | ✅ 防止并发写入数据库 | ❌ 编辑无重试机制 | ❌ 用户编辑丢失，需手动重新编辑 | ❌ 元数据不一致，需全量同步 |
+| **场景 4**：交替到达 | 编辑 V1 | 上传批 V1 | ❌ 上传批被丢弃 | ✅ 防止并发写入数据库 | ❌ 上传批无重试机制 | 无影响（全量同步兜底） | 不一致直到全量同步 |
+| **场景 5**：交替到达 | 编辑 V1 | 编辑 V2 | ❌ 后编辑被丢弃 | ✅ 防止并发写入数据库 | ❌ 编辑无防抖、无队列 | ❌ 用户编辑丢失，需手动重新编辑 | ❌ 元数据不一致，需全量同步 |
+| **场景 6**：V1/V2 混合队列 | 上传批 V1 | 上传批 V2 | ⚠️ 部分事件被跳过 | ✅ 类型检查 continue | ❌ V1/V2 共享队列 | 无影响（全量同步兜底） | 不一致直到全量同步 |
+| **场景 7**：批处理异常 | 任意 | 任意 | ❌ 整批丢失 | ✅ 异常捕获不崩溃 | ❌ 无重试机制 | 无影响（全量同步兜底） | 不一致直到全量同步 |
+| **场景 8**：高频编辑 | 编辑 V1 | 编辑 V1 | ❌ 后续编辑被丢弃 | ✅ 防止并发写入数据库 | ❌ 编辑无防抖、无队列 | ❌ 用户编辑丢失 | ❌ 元数据不一致 |
+
+### 5.12 缺口总结（含编辑事件）
 
 | 缺口 | 风险 | 严重程度 |
 |------|------|---------|
@@ -567,6 +723,9 @@ Future<void> handleWsAssetUploadReadyV1Batch(List<dynamic> batchData) async {
 | 部分成功无断点续处理 | 部分事件丢失 | ⚠️ 低 |
 | 无事件持久化队列 | 应用重启后丢失未处理事件 | ⚠️ 低（全量同步兜底） |
 | 无丢弃事件日志 | 问题难以排查 | ⚠️ 低 |
+| **编辑事件与上传事件共享门闩** | **编辑事件可能被上传阻塞丢弃** | ⚠️ **高**（用户编辑丢失） |
+| **编辑事件无防抖** | **高频编辑连续丢弃** | ⚠️ **高**（用户编辑丢失） |
+| **编辑事件无重试** | **丢弃后无恢复机制** | ⚠️ **高**（用户编辑丢失） |
 
 ---
 
