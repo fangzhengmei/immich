@@ -32,12 +32,33 @@ date_trunc('MONTH', "localDateTime" AT TIME ZONE 'UTC') AT TIME ZONE 'UTC'
 
 ### 2.2 分桶 API
 
-**重要说明**：两个端点都使用 **查询参数（Query Parameter）** 传递 `timeBucket`，而非路径参数。
+两个端点都使用 **查询参数（Query Parameter）**，而非路径参数。
 
-| 端点 | 用途 | 参数 | 返回值 |
-|------|------|------|--------|
-| `GET /timeline/buckets` | 获取所有时间桶列表 | 筛选、排序参数 | `[{ timeBucket: "2024-01-01", count: 42 }]` |
-| `GET /timeline/bucket` | 获取单个桶内的资产详情 | `?timeBucket=2024-01-01` + 其他参数 | 资产属性数组（id、ratio、thumbhash 等） |
+#### GET /timeline/buckets — 获取时间桶列表
+
+**用途**：获取符合筛选条件的所有时间桶元数据（不含资产详情）。
+
+**参数**（均为可选）：
+- `userId` / `albumId` / `personId` / `tagId` — 范围筛选
+- `isFavorite` / `isTrashed` / `visibility` — 状态筛选
+- `orderBy` / `order` — 分桶排序方式
+- `withStacked` / `withPartners` / `withCoordinates` — 内容控制
+- `bbox` — 地理边界筛选
+
+**返回值**：
+```json
+[{ "timeBucket": "2024-01-01", "count": 42 }, { "timeBucket": "2024-02-01", "count": 17 }]
+```
+
+#### GET /timeline/bucket — 获取单个桶的资产详情
+
+**用途**：获取指定时间桶内的所有资产详情。
+
+**参数**：
+- **`timeBucket`（必需）** — 格式 `YYYY-MM-DD`，如 `2024-01-01`
+- 上述所有筛选、排序参数（与 buckets 端点相同）
+
+**返回值**：资产属性列式数组（id、ratio、thumbhash、localOffsetHours 等）
 
 **控制器实现**（`timeline.controller.ts:26-37`）：
 ```typescript
@@ -49,7 +70,7 @@ getTimeBucket(@Auth() auth: AuthDto, @Query() dto: TimeBucketAssetDto) {
 
 ### 2.3 TimeBucket 参数特殊处理
 
-**前导正负号清理**是一个关键的隐式行为，实现于 `asset.repository.ts:820`：
+**前导正负号清理**是一个关键的隐式行为，仅影响 `GET /timeline/bucket` 端点，实现于 `asset.repository.ts:820`：
 
 ```typescript
 .where(truncatedDate(options.orderBy), '=', timeBucket.replace(/^[+-]/, ''))
@@ -60,23 +81,25 @@ getTimeBucket(@Auth() auth: AuthDto, @Query() dto: TimeBucketAssetDto) {
 - 例如：`"+2024-01-01"` → `"2024-01-01"`，`"-0001-01-01"` → `"0001-01-01"`
 - 仅移除开头的单个正负号，后续字符不受影响
 
-**对分页结果的影响**：
+### 2.4 单桶匹配一致性与异常输入容错
 
-1. **公元前日期处理**：
+正负号清理行为对单桶查询的影响：
+
+1. **单桶匹配一致性**：
+   - `getTimeBuckets` 返回的 `timeBucket` 字段格式为 `YYYY-MM-DD`，不带正负号
+   - 前端正常使用返回值调用 `getTimeBucket` 时，不会触发符号清理
+   - 因此常规分页流程不受影响，分桶列表与单桶查询结果保持一致
+
+2. **异常输入容错**：
+   - 意外带 `+` 号的参数（如 `"+2024-01-01"`）仍能正确匹配到 2024 年 1 月
+   - 这提供了一定的输入容错性，但也隐藏了潜在的客户端格式错误
+
+3. **公元前日期限制**：
    - 理论上 ISO 8601 格式中公元前年份以 `-` 开头（如 `-0001-01-01` 表示公元前 1 年）
    - 但由于前导 `-` 会被移除，`"-0001-01-01"` 会被当作 `"0001-01-01"`（公元 1 年）处理
    - **结论**：当前实现无法正确查询公元前的资产
 
-2. **异常输入容错**：
-   - 意外带 `+` 号的参数（如 `"+2024-01-01"`）仍能正确匹配
-   - 这提供了一定的输入容错性，但也隐藏了潜在的客户端格式错误
-
-3. **分页一致性**：
-   - `getTimeBuckets` 返回的 `timeBucket` 字段不带正负号（格式化为 `YYYY-MM-DD`）
-   - 因此前端使用返回值作为参数调用 `getTimeBucket` 时不会触发符号清理
-   - 只有当客户端手动构造带符号的 timeBucket 时才会受此行为影响
-
-### 2.3 分桶查询流程
+### 2.5 分桶查询流程
 
 ```typescript
 // server/src/services/timeline.service.ts:12-16
@@ -351,7 +374,9 @@ async getTimeBucket(timeBucket: string, options: TimeBucketOptions, cursor?: Cur
 | 时间分桶查询 | `server/src/repositories/asset.repository.ts` | 709-761 |
 | 单桶资产查询 | `server/src/repositories/asset.repository.ts` | 766-911 |
 | 时间分桶 DTO | `server/src/dtos/time-bucket.dto.ts` | 1-136 |
+| 时间线控制器 | `server/src/controllers/timeline.controller.ts` | 1-38 |
 | 时间线服务 | `server/src/services/timeline.service.ts` | 1-81 |
+| timeBucket 符号清理 | `server/src/repositories/asset.repository.ts` | 820 |
 | 前端时间线管理器 | `web/src/lib/managers/timeline-manager/timeline-manager.svelte.ts` | 1-644 |
 | 月份分桶类 | `web/src/lib/managers/timeline-manager/timeline-month.svelte.ts` | 1-394 |
 | 分桶日期截断 | `server/src/utils/database.ts` | 301-303 |
