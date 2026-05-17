@@ -26,13 +26,39 @@ Memory 生成由定时任务驱动，在 `memory.service.ts:16-45` 中定义：
 ```typescript
 @OnJob({ name: JobName.MemoryGenerate, queue: QueueName.BackgroundTask })
 async onMemoriesCreate() {
-  // 遍历用户，为每个用户生成回忆
+  const users = await this.userRepository.getList({ withDeleted: false });
+
+  await this.databaseRepository.withLock(DatabaseLock.MemoryCreation, async () => {
+    const state = await this.systemMetadataRepository.get(SystemMetadataKey.MemoriesState);
+    const start = DateTime.utc().startOf('day').minus({ days: DAYS });
+    const lastOnThisDayDate = state?.lastOnThisDayDate ? DateTime.fromISO(state.lastOnThisDayDate) : start;
+
+    // generate a memory +/- X days from today
+    for (let i = 0; i <= DAYS * 2; i++) {
+      const target = start.plus({ days: i });
+      if (lastOnThisDayDate >= target) {
+        continue;
+      }
+
+      this.logger.log(`Creating memories for ${target.toISO()}`);
+      try {
+        await Promise.all(users.map((owner) => this.createOnThisDayMemories(owner.id, target)));
+      } catch (error) {
+        this.logger.error(`Failed to create memories for ${target.toISO()}: ${error}`);
+      }
+      // update system metadata even when there is an error to minimize the chance of duplicates
+      await this.systemMetadataRepository.set(SystemMetadataKey.MemoriesState, {
+        ...state,
+        lastOnThisDayDate: target.toISO(),
+      });
+    }
+  });
 }
 ```
 
 **关键参数**：
 - 时间窗口：`DAYS = 3`（生成当天 ±3 天范围内的回忆，共 7 天）
-- 幂等保证：通过 `SystemMetadataKey.MemoriesState` 记录最后处理日期，避免重复生成
+- 幂等保证：通过 `SystemMetadataKey.MemoriesState` 记录最后处理日期
 - 分布式锁：使用 `DatabaseLock.MemoryCreation` 防止并发重复执行
 
 ### 2.2 清理机制
@@ -56,43 +82,101 @@ async onMemoriesCleanup() {
 
 ---
 
-## 三、素材筛选逻辑
+## 三、素材筛选与日期匹配逻辑
+
+### 3.1 getByDayOfYear 精确日期匹配链路
 
 核心筛选逻辑在 `asset.repository.ts:448-496` 的 `getByDayOfYear` 方法中实现。
 
-### 3.1 筛选条件
+```typescript
+getByDayOfYear(ownerIds: string[], { year, day, month }: YearMonthDay) {
+  return this.db
+    .with('res', (qb) =>
+      qb
+        .with('today', (qb) =>
+          qb
+            .selectFrom((eb) =>
+              eb
+                .fn('generate_series', [
+                  sql`(select date_part('year', min(("localDateTime" at time zone 'UTC')::date))::int from asset)`,
+                  sql`${year - 1}`,
+                ])
+                .as('year'),
+            )
+            .select((eb) => eb.fn('make_date', [sql`year::int`, sql`${month}::int`, sql`${day}::int`]).as('date')),
+        )
+        .selectFrom('today')
+        .innerJoinLateral(
+          (qb) =>
+            qb
+              .selectFrom('asset')
+              .select(['asset.id', 'asset.localDateTime'])
+              .innerJoin('asset_job_status', 'asset.id', 'asset_job_status.assetId')
+              .where(sql`(asset."localDateTime" at time zone 'UTC')::date`, '=', sql`today.date`)
+              .where('asset.ownerId', '=', anyUuid(ownerIds))
+              .where('asset.visibility', '=', AssetVisibility.Timeline)
+              .where((eb) =>
+                eb.exists((qb) =>
+                  qb
+                    .selectFrom('asset_file')
+                    .whereRef('assetId', '=', 'asset.id')
+                    .where('asset_file.type', '=', AssetFileType.Preview),
+                ),
+              )
+              .where('asset.deletedAt', 'is', null)
+              .orderBy(sql`(asset."localDateTime" at time zone 'UTC')::date`, 'desc')
+              .limit(20)
+              .as('a'),
+          (join) => join.onTrue(),
+        )
+        .selectAll('a'),
+    )
+    .selectFrom('res')
+    .select(sql<number>`date_part('year', ("localDateTime" at time zone 'UTC')::date)::int`.as('year'))
+    .select((eb) => eb.fn.jsonAgg(eb.table('res')).as('assets'))
+    .groupBy(sql`("localDateTime" at time zone 'UTC')::date`)
+    .orderBy(sql`("localDateTime" at time zone 'UTC')::date`, 'desc')
+    .execute();
+}
+```
+
+### 3.2 筛选条件详解
 
 | 条件 | 说明 | 代码位置 |
 |------|------|----------|
-| 日期匹配 | `(asset."localDateTime" at time zone 'UTC')::date = today.date` | L471 |
+| 精确日期匹配 | `(asset."localDateTime" at time zone 'UTC')::date = today.date` | L471 |
 | 所有权 | `asset.ownerId = anyUuid(ownerIds)` | L472 |
 | 可见性 | `asset.visibility = AssetVisibility.Timeline` | L473 |
 | 预览文件 | 必须存在 `AssetFileType.Preview` 类型的文件 | L474-L480 |
 | 未删除 | `asset.deletedAt is null` | L482 |
 | 任务状态记录 | 必须存在 `asset_job_status` 记录（仅表示状态记录存在） | L470 |
 
-> **重要修正**：
+> **重要说明**：
 > - `innerJoin('asset_job_status', 'asset.id', 'asset_job_status.assetId')` 仅表示该资产存在任务状态记录，**不代表转码已完成**。即使转码失败也可能存在该记录。
 
-### 3.2 日期生成策略
+### 3.3 为什么「同一照片在±3天窗口跨 Memory 重复」不成立
 
-SQL 使用 `generate_series` 生成年份序列：
+**关键链路分析**：
 
-```sql
-generate_series(
-  (select date_part('year', min(("localDateTime" at time zone 'UTC')::date))::int from asset),
-  ${year - 1}  -- 截止到去年
-) as "year"
-```
+1. **精确日期匹配**：`getByDayOfYear` 的核心匹配条件是：
+   ```sql
+   (asset."localDateTime" at time zone 'UTC')::date = today.date
+   ```
+   这是一个严格的**等于**匹配，而非范围匹配。
 
-然后使用 `make_date(year::int, ${month}::int, ${day}::int)` 构造具体日期。
+2. **每张照片有唯一拍摄日期**：资产的 `localDateTime` 是固定的，转换为日期后也是唯一的。
 
-**设计意图**：
-- 从最早资产的年份开始，到去年为止
-- 每年的同一天生成一个独立的 Memory
-- 每个 Memory 最多包含 20 张照片（`limit 20`，L484）
+3. **循环处理独立日期**：虽然外层循环处理 ±3 天共 7 个 target 日期，但每个 target 调用 `getByDayOfYear` 时传入的是不同的 `{year, month, day}` 参数。
 
-### 3.3 隐藏人物过滤
+4. **匹配结果互斥**：
+   - 假设照片A拍摄于 2023-05-15
+   - 当 target=2024-05-14 时，`today.date` 生成 2023-05-14，不匹配
+   - 当 target=2024-05-15 时，`today.date` 生成 2023-05-15，**唯一匹配**
+   - 当 target=2024-05-16 时，`today.date` 生成 2023-05-16，不匹配
+
+**结论**：每张照片只会在一个 target 日期的调用中被匹配到，不会跨多个 Memory 重复出现。±3 天窗口的设计目的是覆盖时区差异和任务重试，而非模糊匹配日期范围。
+
+### 3.4 隐藏人物过滤
 
 在 `memory.repository.ts:71-82` 的查询中，额外过滤了包含隐藏人物的资产：
 
@@ -122,7 +206,22 @@ private async createOnThisDayMemories(ownerId: string, target: DateTime) {
   const showAt = target.startOf('day').toISO();
   const hideAt = target.endOf('day').toISO();
   const memories = await this.assetRepository.getByDayOfYear([ownerId], target);
-  // ... 为每个年份创建 Memory
+  
+  await Promise.all(
+    memories.map(({ year, assets }) =>
+      this.memoryRepository.create(
+        {
+          ownerId,
+          type: MemoryType.OnThisDay,
+          data: { year },
+          memoryAt: target.set({ year }).toISO()!,
+          showAt,
+          hideAt,
+        },
+        new Set(assets.map(({ id }) => id)),
+      ),
+    ),
+  );
 }
 ```
 
@@ -145,14 +244,14 @@ make_date(year::int, 2::int, 29::int)
 
 **问题路径**：
 
-| 年份 | `make_date(year, 2, 29) 结果 | 说明 |
-|------|----------------------------------|------|
+| 年份 | `make_date(year, 2, 29)` 结果 | 说明 |
+|------|--------------------------------|------|
 | 2020 | 2020-02-29 | 成功，2020是闰年 |
 | 2021 | **ERROR** | 2021不是闰年，2月没有29天 |
 | 2022 | **ERROR** | 2022不是闰年 |
 | 2023 | **ERROR** | 2023不是闰年 |
 
-**PostgreSQL 中 `make_date(2021, 2, 29)` 会抛出错误：
+**PostgreSQL 中 `make_date(2021, 2, 29)` 会抛出错误**：
 ```
 ERROR:  date field value out of range: 2021-02-29
 ```
@@ -170,7 +269,7 @@ ERROR:  date field value out of range: 2021-02-29
 
 #### 代码层面的验证
 
-查看 `getByDayOfYear的SQL构造：
+查看 `getByDayOfYear` 的 SQL 构造：
 ```typescript
 .selectFrom((eb) =>
   eb
@@ -180,12 +279,13 @@ ERROR:  date field value out of range: 2021-02-29
     ])
     .as('year'),
 )
-.select((eb) => eb.fn('make_date', [sql`year::int`, sql`${month}::int`, sql`${day}::int`]).as('date')
+.select((eb) => eb.fn('make_date', [sql`year::int`, sql`${month}::int`, sql`${day}::int`]).as('date'))
 ```
 
 这里没有对闰日做任何特殊处理，直接将 `month` 和 `day` 传入 `make_date`。
 
-#### 可能的修复方向**：
+#### 可能的修复方向
+
 - 在调用 `getByDayOfYear` 前检查是否为闰日，如果是闰日且目标年份不是闰年时：
   - 方案A：降级匹配2月28日
   - 方案B：跳过该年份
@@ -193,9 +293,11 @@ ERROR:  date field value out of range: 2021-02-29
 
 ---
 
-## 五、去重机制
+## 五、去重机制与幂等边界
 
-### 5.1 系统级去重（防止重复生成）
+### 5.1 现有防重措施
+
+#### 5.1.1 系统级幂等（日期级）
 
 通过 `SystemMetadataKey.MemoriesState` 记录最后处理日期：
 
@@ -217,22 +319,22 @@ for (let i = 0; i <= DAYS * 2; i++) {
 ```
 
 **特点**：
-- 即使某次生成失败也会更新 `lastOnThisDayDate`，避免重复尝试
-- 极端情况下状态丢失可能导致重复生成
+- 日期级别的幂等保证，已处理过的日期不会重复处理
+- 使用分布式锁 `DatabaseLock.MemoryCreation` 防止并发重复执行
 
-### 5.2 资产级去重
+#### 5.1.2 资产级去重
 
 ```typescript
 this.memoryRepository.create(
-  { /* memory data */,
+  { /* memory data */ },
   new Set(assets.map(({ id }) => id)),  // 使用 Set 天然去重
 );
 ```
 
-- 使用 `Set<string>` 存储 assetIds，天然去重
+- 使用 `Set<string>` 存储 assetIds，单个 Memory 内部天然去重
 - `memory_asset` 关联表保证资产与 Memory 的多对多关系
 
-### 5.3 展示级过滤
+#### 5.1.3 展示级过滤
 
 前端 `memory-manager.svelte.ts:134-136`：
 
@@ -246,7 +348,7 @@ private async load() {
 - 只展示当前日期范围内的 Memory（通过 `$for` 参数过滤）
 - 过滤掉资产为空的 Memory
 
-### 5.4 后端搜索过滤
+#### 5.1.4 后端搜索过滤
 
 `memory.repository.ts:37-41`：
 
@@ -257,6 +359,134 @@ private async load() {
     .where((where) => where.or([where('hideAt', 'is', null), where('hideAt', '>=', dto.for!)]),
 )
 ```
+
+---
+
+### 5.2 漏生成风险
+
+#### 5.2.1 Promise.all 部分失败导致的漏生成
+
+**核心问题**：`Promise.all` 任一用户失败，但 `lastOnThisDayDate` 仍前移。
+
+```typescript
+try {
+  await Promise.all(users.map((owner) => this.createOnThisDayMemories(owner.id, target)));
+} catch (error) {
+  this.logger.error(`Failed to create memories for ${target.toISO()}: ${error}`);
+}
+// 无论成功失败，都前移 lastOnThisDayDate
+await this.systemMetadataRepository.set(SystemMetadataKey.MemoriesState, {
+  ...state,
+  lastOnThisDayDate: target.toISO(),
+});
+```
+
+**风险场景**：
+
+| 时间点 | 操作 | 结果 |
+|--------|------|------|
+| T1 | 获取 users = [userA, userB, userC] | 共3个用户 |
+| T2 | Promise.all 并发执行 createOnThisDayMemories | userA 成功，userB 成功，userC 失败（如 DB 超时） |
+| T3 | catch 捕获异常，记录 error log | 仅记录日志，不重试 |
+| T4 | 更新 lastOnThisDayDate = target | 该日期标记为已处理 |
+| T5 | 下次任务执行 | lastOnThisDayDate >= target，跳过该日期 |
+
+**后果**：
+- userC 在该日期的回忆**永久丢失**
+- 除非手动清理 `system_metadata` 中的 `MemoriesState`，否则永远不会重试
+- 日志中仅有一条 error 记录，难以发现和排查
+
+#### 5.2.2 缺少唯一约束导致的重复生成风险
+
+**当前表结构**（`memory.table.ts`）：
+
+Memory 表的字段包括：
+- `id` (uuid, 主键)
+- `ownerId` (uuid, 外键)
+- `type` (MemoryType enum)
+- `memoryAt` (timestamp)
+- `showAt`, `hideAt` 等
+
+**缺失的约束**：
+
+表中没有定义 `(ownerId, type, memoryAt)` 或 `(ownerId, type, data->>'year', showAt)` 的唯一约束。
+
+**重复生成条件**：
+
+虽然 `lastOnThisDayDate` 机制在正常情况下可以防止重复，但以下情况可能导致重复：
+
+1. **SystemMetadata 状态丢失**：如果 `system_metadata` 表中的 `MemoriesState` 记录被删除或损坏，`lastOnThisDayDate` 会重置为 `start`（3天前），导致重新生成这7天的回忆。
+
+2. **分布式锁失效**：如果 `DatabaseLock.MemoryCreation` 锁机制失效，多个实例可能同时执行生成任务。
+
+3. **任务并发执行**：如果定时任务调度器重复触发，且锁获取失败或释放过早。
+
+在以上情况下，由于没有数据库级唯一约束，同一用户的同一日期可能生成多条重复的 Memory 记录。
+
+---
+
+### 5.3 可验证改进
+
+#### 5.3.1 Promise.all 失败处理改进
+
+**方案A：用户级独立错误处理**
+
+```typescript
+// 改为逐个处理用户，单个用户失败不影响其他用户
+for (const owner of users) {
+  try {
+    await this.createOnThisDayMemories(owner.id, target);
+  } catch (error) {
+    this.logger.error(`Failed to create memories for user ${owner.id} on ${target.toISO()}: ${error}`);
+    // 可考虑记录失败用户列表，后续重试
+  }
+}
+```
+
+**方案B：记录失败用户，单独重试**
+
+```typescript
+const failedUsers: string[] = [];
+await Promise.all(users.map(async (owner) => {
+  try {
+    await this.createOnThisDayMemories(owner.id, target);
+  } catch (error) {
+    failedUsers.push(owner.id);
+    this.logger.error(`Failed to create memories for user ${owner.id} on ${target.toISO()}: ${error}`);
+  }
+}));
+
+// 对失败用户进行重试
+for (const owner of failedUsers) {
+  try {
+    await this.createOnThisDayMemories(owner.id, target);
+  } catch (error) {
+    this.logger.error(`Retry failed for user ${owner.id} on ${target.toISO()}: ${error}`);
+  }
+}
+```
+
+#### 5.3.2 增加数据库唯一约束
+
+在 `memory.table.ts` 中添加唯一约束：
+
+```typescript
+@Unique(['ownerId', 'type', 'memoryAt'])
+```
+
+或更精确的：
+
+```typescript
+@Unique(['ownerId', 'type', 'showAt', 'hideAt'])
+```
+
+这样即使应用层幂等机制失效，数据库也会拒绝重复插入。
+
+#### 5.3.3 引入按用户的幂等标记
+
+除了全局的 `lastOnThisDayDate`，可以考虑：
+- 增加 `user_memory_state` 表，记录每个用户的最后处理日期
+- 或在生成前先查询该用户该日期是否已有 Memory
 
 ---
 
@@ -431,7 +661,8 @@ hideAssetsFromMemory(ids: string[]) {
 
 1. **闰日处理缺失**：2月29日在非闰年时 `make_date` 会失败，导致回忆生成失败
 2. **asset_job_status 含义不精确**：仅检查记录存在，不保证转码成功
-3. **跨 Memory 资产重复**：同一张照片可能出现在 ±3 天窗口的多个 Memory 中
+3. **Promise.all 部分失败风险**：单个用户失败导致该用户该日期回忆永久丢失
+4. **缺少数据库唯一约束**：极端情况下可能生成重复 Memory
 
 ### 10.2 潜在优化
 
@@ -441,6 +672,8 @@ hideAssetsFromMemory(ids: string[]) {
 4. **批量管理**：支持批量保存/删除多个 Memory
 5. **预览生成优化**：当前要求必须有 Preview 文件，可考虑降级使用缩略图
 6. **转码状态校验**：增加对 asset_job_status 中具体字段的检查，确保转码成功
+7. **用户级错误处理**：改进 Promise.all 失败处理，避免单个用户失败影响整体
+8. **增加唯一约束**：在 memory 表增加 (ownerId, type, memoryAt) 唯一约束
 
 ---
 
