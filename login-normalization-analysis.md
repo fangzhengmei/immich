@@ -109,6 +109,223 @@ LDAP 目录 ──(LDAP协议)──> IdP (Authelia/Keycloak) ──(OIDC协议)
 
 ---
 
+### 3.3 LDAP 经 IdP 接入的 Claim 映射与冲突对照表
+
+下表完整描述了 LDAP 属性如何通过 IdP 映射到 Immich 字段，以及各字段冲突时的处理路径和后果：
+
+| LDAP 属性 | IdP Claim | Immich 字段 | 映射时机 | 冲突场景 | 处理路径 | 处理结果 |
+|-----------|-----------|-------------|----------|----------|----------|----------|
+| `entryUUID` / `uidNumber` | `sub` (必填) | `oauthId` | 每次登录 | sub 未找到用户，邮箱也未匹配 | 自动注册路径（autoRegister=true） | 创建新用户 |
+| | | | | sub 未找到用户，邮箱匹配到无 oauthId 的用户 | 自动关联路径 `auth.service.ts:320-330` | 更新该用户的 oauthId，登录成功 |
+| | | | | sub 未找到用户，邮箱匹配到有其他 oauthId 的用户 | 冲突拒绝路径 `auth.service.ts:324-327` | 抛出 `OAuth authentication failed` |
+| | | | | **IdP 端 sub 发生变化**（如 LDAP 条目重建） | 视为新用户，按首次登录处理 | 若 autoRegister=false 则登录失败；若 autoRegister=true 且邮箱已被占用则邮箱冲突 |
+| `mail` / `email` | `email` (必填) | `email` | 每次登录 | OAuth profile 无 email | 直接拒绝 `auth.service.ts:341-343` | 抛出 `OAuth profile does not have an email address` |
+| | | | | 自动注册时邮箱已存在 | 用户创建前检查 `base.service.ts:219-223` | 抛出 `Email is not available` |
+| | | | | **邮箱已绑定他人 OAuth 账号** | 冲突拒绝路径 `auth.service.ts:324-327` | 抛出 `OAuth authentication failed` |
+| `uid` / `sAMAccountName` | `preferred_username` | `storageLabel` | 首次注册 | storageLabel 已被其他用户使用 | 数据库唯一约束 | 抛出 `duplicate key value violates unique constraint` |
+| `cn` / `displayName` | `name` / `given_name` + `family_name` | `name` | 首次注册 | （无唯一约束） | 直接使用 | 可能出现重名，不影响登录 |
+| `immich_role` (自定义) | `immich_role` | `isAdmin` | 首次注册 | 首个用户 role 不为 admin | 管理员检查 `base.service.ts:225-230` | 抛出 `The first registered account must the administrator.` |
+| `immich_quota` (自定义) | `immich_quota` | `quotaSizeInBytes` | 首次注册 | claim 值非数字或负数 | 默认值回退 `auth.service.ts:352-356` | 使用 `defaultStorageQuota` |
+
+---
+
+### 3.4 典型冲突场景的处理路径详解
+
+#### 3.4.1 sub 变化场景
+
+**场景描述**：
+- LDAP 目录中用户条目被删除后重建，导致 `entryUUID` 变化
+- IdP 配置变更，导致 `sub` 声明的生成规则改变
+- 用户在 LDAP 中的 DN 变化，而 IdP 使用 DN 作为 sub
+
+**处理路径**：
+```
+OAuth 登录回调
+    ↓
+getByOAuthId(new_sub) → 返回 undefined
+    ↓
+尝试通过 email 查找用户
+    ├─ 找到用户且该用户 oauthId 为空 → 自动关联（更新 oauthId）
+    ├─ 找到用户但该用户 oauthId ≠ new_sub → 冲突拒绝（邮箱已绑定他人）
+    └─ 未找到用户 → 进入自动注册流程
+        ├─ autoRegister=true → 尝试创建新用户
+        │   ├─ 邮箱未被占用 → 创建成功
+        │   └─ 邮箱已被占用 → 邮箱冲突，创建失败
+        └─ autoRegister=false → 登录失败
+```
+
+**管理员应对措施**：
+1. 若旧账号仍在，可让用户先通过密码登录，使用 `POST /oauth/unlink` 解除旧绑定，再重新 OAuth 登录
+2. 或直接在数据库中更新用户的 `oauthId` 字段为新的 sub 值
+
+---
+
+#### 3.4.2 邮箱已绑定他人 OAuth 场景
+
+**场景描述**：
+- 用户 A 的邮箱 `user@example.com` 已绑定 OAuth 账号 sub_1
+- 用户 B 在 IdP 中被分配了相同邮箱 `user@example.com`，其 sub 为 sub_2
+- 用户 B 尝试通过 OAuth 登录 Immich
+
+**处理路径** `auth.service.ts:320-330`：
+```
+getByOAuthId(sub_2) → undefined
+    ↓
+getByEmail(user@example.com) → 找到用户 A（oauthId=sub_1）
+    ↓
+检查 emailUser.oauthId → 非空且 ≠ sub_2
+    ↓
+抛出 BadRequestException('OAuth authentication failed')
+```
+
+**日志输出**：
+```
+OAuth login conflict: email already linked to different account
+```
+
+**管理员应对措施**：
+1. 核实邮箱所有权归属
+2. 若邮箱应归用户 B，需先解除用户 A 的 OAuth 绑定（`POST /oauth/unlink` 或数据库操作）
+3. 确保 IdP 中邮箱分配的唯一性
+
+---
+
+#### 3.4.3 手动 link 冲突场景
+
+**场景描述**：
+- 用户 A 已通过密码登录，尝试将 OAuth 账号 sub_x 关联到自己
+- 但 sub_x 已被用户 B 绑定
+
+**处理路径** `auth.service.ts:407-435`：
+```
+POST /oauth/link（用户 A 已认证）
+    ↓
+完成 OAuth 授权，获取 oauthId=sub_x
+    ↓
+getByOAuthId(sub_x) → 找到用户 B
+    ↓
+检查 duplicate.id !== auth.user.id → true
+    ↓
+抛出 BadRequestException('This OAuth account has already been linked to another user.')
+```
+
+**管理员应对措施**：
+1. 核实 OAuth 账号归属
+2. 若应归用户 A，需先解除用户 B 的绑定
+3. 或让用户 A 使用其他 OAuth 账号
+
+---
+
+### 3.5 LDAP 经 IdP 接入归一化冲突对照表
+
+下表按实际执行顺序，完整列出 LDAP 经 IdP 接入时可能出现的所有归一化冲突场景：
+
+| 序号 | Claim 来源 | Immich 落库字段 | 触发条件 | 代码处理路径 | 最终返回结果 |
+|------|-----------|----------------|----------|--------------|--------------|
+| 1 | `sub` (LDAP entryUUID) | `oauthId` | `getByOAuthId(sub)` 找到用户 | `auth.service.ts:318` 直接使用该用户 | 登录成功，创建会话 |
+| 2 | `sub` (LDAP entryUUID) | `oauthId` | `getByOAuthId(sub)` 未命中，但 `getByEmail(email)` 找到用户且 `oauthId` 为空 | `auth.service.ts:320-330` 自动关联分支，`update(user.id, { oauthId: sub })` | 登录成功，用户 `oauthId` 被更新 |
+| 3 | **`sub` 变化** (LDAP 条目重建) | `oauthId` | `getByOAuthId(new_sub)` 未命中，`getByEmail(email)` 找到用户但 `oauthId ≠ new_sub` | `auth.service.ts:324-327` 冲突拒绝分支，检查 `emailUser.oauthId` 非空 | `400 Bad Request`，消息：`OAuth authentication failed`，日志：`email already linked to different account` |
+| 4 | **`sub` 变化** (LDAP 条目重建) | `oauthId` | `getByOAuthId(new_sub)` 未命中，`getByEmail(email)` 未命中，`autoRegister=true` | `auth.service.ts:332-375` 自动注册分支，调用 `createUser()` | 若邮箱未被占用：创建新用户成功；若邮箱已被占用：`400 Bad Request`，消息：`Email is not available` |
+| 5 | **`sub` 变化** (LDAP 条目重建) | `oauthId` | `getByOAuthId(new_sub)` 未命中，`getByEmail(email)` 未命中，`autoRegister=false` | `auth.service.ts:333-339` 拒绝分支 | `400 Bad Request`，消息：`OAuth authentication failed`，日志：`auto registering is disabled` |
+| 6 | `email` (LDAP mail) | `email` | OAuth profile 无 `email` 字段或为空 | `auth.service.ts:341-343` 直接拒绝 | `400 Bad Request`，消息：`OAuth profile does not have an email address` |
+| 7 | `email` (LDAP mail) | `email` | `getByOAuthId(sub)` 未命中，`getByEmail(email)` 找到用户但该用户的 `oauthId` 是**其他用户的 sub** | `auth.service.ts:324-327` 冲突拒绝分支 | `400 Bad Request`，消息：`OAuth authentication failed`，日志：`email already linked to different account` |
+| 8 | `email` (LDAP mail) | `email` | 自动注册时 `createUser()` 发现邮箱已存在 | `base.service.ts:219-223` 邮箱唯一性检查 | `400 Bad Request`，消息：`Email is not available` |
+| 9 | `sub` (手动 link 流程) | `oauthId` | `POST /oauth/link` 时 `getByOAuthId(sub)` 找到其他用户 | `auth.service.ts:424-427` 重复绑定检查 | `400 Bad Request`，消息：`This OAuth account has already been linked to another user.` |
+| 10 | `sub` (手动 link 流程) | `oauthId` | `POST /oauth/link` 时 `getByOAuthId(sub)` 找到当前用户自己 | `auth.service.ts:424-427` 检查通过，`duplicate.id === auth.user.id` | 关联成功，`update(auth.user.id, { oauthId })` |
+| 11 | `immich_role` (LDAP 自定义属性) | `isAdmin` | 系统无管理员，新用户 `roleClaim` 不为 `admin` | `base.service.ts:225-230` 管理员检查 | `400 Bad Request`，消息：`The first registered account must the administrator.` |
+| 12 | `preferred_username` (LDAP uid) | `storageLabel` | 自动注册时 `storageLabel` 与已有用户重复 | 数据库唯一约束违反 | `500 Internal Server Error`，消息：`duplicate key value violates unique constraint "user_storageLabel_key"` |
+
+---
+
+### 3.6 归一化冲突串联说明
+
+LDAP 经 IdP 接入时，OAuth 登录回调的实际执行顺序与冲突分流如下：
+
+```
+                  ┌─────────────────────────────────┐
+                  │     POST /oauth/callback        │
+                  │  携带 OAuth code + state        │
+                  └────────────────┬────────────────┘
+                                   │
+                          验证 state、code_verifier
+                                   │
+         ┌─────────────────────────┼─────────────────────────┐
+         │ 失败                    │ 成功                    │ 失败
+         ▼                         ▼                         ▼
+  400: state missing      换取 token，获取 profile   400: code_verifier missing
+                                   │
+                        profile.sub 必须存在 ────失败───► 抛出 OAuth login failed
+                                   │
+                        提取 email 并规范化
+                                   │
+         ┌─────────────────────────┼─────────────────────────┐
+         │ email 为空              │ email 有效              │
+         ▼                         ▼                         │
+  【场景 6】                        │                         │
+  400: 无 email 地址               │                         │
+                                   ▼                         │
+               ┌── getByOAuthId(profile.sub) ──┐             │
+               │                                │             │
+               ▼ 找到用户                       ▼ 未找到      │
+       【场景 1】 登录成功            getByEmail(normalizedEmail) │
+                                               │             │
+                                    ┌──────────┼──────────┐  │
+                                    │ 找到用户 │ 未找到   │  │
+                                    ▼          ▼          │  │
+                          检查 user.oauthId     autoRegister? │
+                          ┌───────┴───────┐    ┌───┴───┐    │
+                          │  为空         │    │ true  │    │
+                          ▼               ▼    ▼       ▼    │
+                   【场景 2】        【场景 3】 【场景 4】【场景 5】│
+                   自动关联成功    400: 冲突  创建用户  400: 禁用│
+                                                          │  │
+                                                          └──┘
+```
+
+**执行顺序详解**：
+
+1. **第一步：参数校验**（`auth.service.ts:298-306`）
+   - 校验 OAuth state 是否存在
+   - 校验 PKCE code_verifier 是否存在
+   - 任一缺失直接返回 400
+
+2. **第二步：获取用户 Profile**（`auth.service.ts:308-314`）
+   - 调用 `oauthRepository.getProfileAndOAuthSid()` 换取 token
+   - 从 ID token 或 UserInfo 端点获取 profile
+   - `profile.sub` 必须存在，否则抛出异常
+
+3. **第三步：邮箱规范化与校验**（`auth.service.ts:315`）
+   - `normalizedEmail = profile.email?.trim().toLowerCase()`
+   - 后续自动关联和自动注册都依赖此值
+   - 若 email 为空，到自动注册阶段会触发【场景 6】
+
+4. **第四步：按优先级查找用户**
+   - **优先查 oauthId**：`getByOAuthId(profile.sub)` → 命中即【场景 1】登录成功
+   - **其次查 email**：oauthId 未命中时，`getByEmail(normalizedEmail)`
+     - 找到用户且 `oauthId` 为空 → 【场景 2】自动关联
+     - 找到用户但 `oauthId` 非空（且不等于当前 sub）→ 【场景 3/7】冲突拒绝
+     - 未找到用户 → 进入自动注册判断
+
+5. **第五步：自动注册判断**
+   - `autoRegister=false` → 【场景 5】拒绝登录
+   - `autoRegister=true` 且 email 为空 → 【场景 6】拒绝
+   - `autoRegister=true` 且 email 有效 → 调用 `createUser()`
+     - 邮箱唯一检查不通过 → 【场景 8】邮箱冲突
+     - 首个用户非 admin → 【场景 11】拒绝
+     - storageLabel 重复 → 【场景 12】数据库异常
+     - 全部通过 → 创建用户成功
+
+6. **手动 Link 流程独立路径**（`auth.service.ts:407-435`）
+   - 用户已通过密码登录（携带有效 session）
+   - 完成 OAuth 授权获取 sub
+   - `getByOAuthId(sub)` 检查是否已绑定
+     - 绑定到其他用户 → 【场景 9】拒绝
+     - 绑定到自己或未绑定 → 【场景 10】关联成功
+
+**设计意图**：通过"oauthId 优先、email 兜底、自动注册为最后手段"的三级查找策略，在保证安全性（防止账号劫持）的前提下，最大程度实现登录方式的平滑迁移。
+
+---
+
 ## 四、账号关联 (Account Linking)
 
 ### 4.1 自动关联（OAuth 登录时）
