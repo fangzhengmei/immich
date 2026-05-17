@@ -92,6 +92,158 @@ private async validate({ headers, queryParams }: Omit<ValidateRequest, 'metadata
 
 **重要**: 只有 `authDto.apiKey` 存在时，才会进入 Scope 校验分支。
 
+### 2.4 多凭证并存排障注意事项
+
+当请求中同时存在多种凭证时，很容易出现"实际认证的凭证与预期不符"的情况。以下是可执行的排障步骤和判定方法。
+
+#### 2.4.1 如何区分 Session 命中与 API Key 命中
+
+**方法1: 检查 AuthDto 结构（最准确）**
+
+在 Controller 中添加调试代码，打印 auth 对象结构：
+```typescript
+@Get('debug-auth')
+@Authenticated({ permission: Permission.AssetRead })
+debugAuth(@Auth() auth: AuthDto) {
+  console.log('=== Auth Debug Info ===');
+  console.log('auth.apiKey exists:', !!auth.apiKey);
+  console.log('auth.session exists:', !!auth.session);
+  console.log('auth.sharedLink exists:', !!auth.sharedLink);
+  if (auth.apiKey) {
+    console.log('API Key permissions:', auth.apiKey.permissions);
+  }
+  return {
+    isApiKey: !!auth.apiKey,
+    isSession: !!auth.session,
+    isSharedLink: !!auth.sharedLink,
+    apiKeyPermissions: auth.apiKey?.permissions || null,
+  };
+}
+```
+
+**判定规则**:
+- `auth.apiKey` 存在 → 命中 API Key 分支，会触发 Scope 校验
+- `auth.session` 存在 → 命中 Session 分支，不会触发 Scope 校验
+- `auth.sharedLink` 存在 → 命中 Shared Link 分支，不会触发 Scope 校验
+
+**方法2: 核对请求头与 Cookie（无需改代码）**
+
+使用 curl 命令发送测试请求，观察返回结果：
+
+**测试1: 纯 API Key 请求（预期命中 API Key）**
+```bash
+curl -X GET "http://localhost:2283/api/assets" \
+  -H "x-api-key: your-api-key-here" \
+  -v 2>&1 | grep -E "(HTTP|x-api-key|Cookie|Authorization)"
+```
+- 确保请求中**不包含** `Cookie`、`Authorization`、`x-immich-user-token`、`x-immich-session-token`
+- 如果返回 403 且提示 `Missing required permission`，说明命中了 API Key 分支且 Scope 校验失败
+
+**测试2: 强制清除 Session 凭证**
+```bash
+curl -X GET "http://localhost:2283/api/assets" \
+  -H "x-api-key: your-api-key-here" \
+  -H "Cookie:" \
+  -H "Authorization:" \
+  -H "x-immich-user-token:" \
+  -H "x-immich-session-token:"
+```
+- 显式清空所有可能的 Session 凭证头
+- 这是确保 API Key 生效的最可靠方法
+
+**方法3: 观察错误信息特征**
+
+| 错误信息 | 命中分支 | 拒绝原因 |
+|---------|---------|---------|
+| `Missing required permission: asset.read` | API Key | Scope 校验拒绝 |
+| `Missing required permission: all` | API Key | Scope 校验拒绝（默认 permission=all） |
+| `Invalid API key` | API Key | 身份认证失败（Key 无效） |
+| `Invalid user token` | Session | 身份认证失败（Session 无效） |
+| 无 Scope 相关错误，直接返回数据 | Session | Session 无 Scope 检查 |
+
+#### 2.4.2 如何定位是优先级短路还是 Scope 校验拒绝
+
+**排障决策树**:
+```
+请求被拒绝 (401/403/400)
+    │
+    ├─ 401 Unauthorized → 身份认证阶段失败，与优先级和 Scope 无关
+    │
+    ├─ 403 Forbidden
+    │   │
+    │   ├─ 错误信息含 "Missing required permission"
+    │   │   → 命中 API Key 分支，Scope 校验拒绝
+    │   │
+    │   ├─ 错误信息为 "Forbidden"（无具体权限名）
+    │   │   ├─ 检查是否是 admin 路由 + 用户非管理员 → adminRoute 拦截
+    │   │   └─ 检查是否是 sharedLink 认证 + 路由无 sharedLink:true → sharedLinkRoute 拦截
+    │   │
+    │   └─ 无 Scope 错误信息但请求被拒
+    │       → 检查是否命中了 Session 或 Shared Link 分支（优先级短路）
+    │
+    └─ 400 Bad Request
+        → 资源级访问控制拒绝，已通过所有路由级检查
+```
+
+**关键区分点**:
+- **优先级短路**: AuthDto 中 `apiKey` 不存在，`session` 或 `sharedLink` 存在。不会出现 "Missing required permission" 错误。
+- **Scope 校验拒绝**: AuthDto 中 `apiKey` 存在，错误信息明确提示缺少某个 permission。
+
+#### 2.4.3 常见误判场景与验证方法
+
+| 预期凭证 | 实际请求包含 | 实际命中 | 现象 | 验证方法 |
+|---------|-------------|---------|------|---------|
+| API Key | `Cookie: immich_access_token=xxx` + `x-api-key: yyy` | Session | API Key 的 Scope 限制完全不生效，误以为是 Scope 配置错误 | 清除 Cookie 后重试，观察是否出现 Scope 错误 |
+| API Key | `Authorization: Bearer xxx` + `x-api-key: yyy` | Session | API Key 的 Scope 限制完全不生效 | 清除 Authorization 头后重试 |
+| API Key | `x-immich-share-key: xxx` + `x-api-key: yyy` | Shared Link | API Key 被完全忽略 | 清除 share-key 头后重试 |
+| Session | `x-immich-share-key: xxx` + `Cookie: immich_access_token=yyy` | Shared Link | Session 被完全忽略 | 清除 share-key 头后重试 |
+
+**验证优先级短路的最小测试**:
+```bash
+# 步骤1: 仅用 API Key 访问（应命中 API Key）
+curl -H "x-api-key: key-with-only-read-permission" \
+  http://localhost:2283/api/assets/delete
+# 预期: 403 Missing required permission: asset.delete
+
+# 步骤2: 添加任意 Session 凭证（应命中 Session，Scope 被绕过）
+curl -H "x-api-key: key-with-only-read-permission" \
+  -H "x-immich-user-token: any-non-empty-value" \
+  http://localhost:2283/api/assets/delete
+# 预期: 不会返回 Scope 错误，因为 Session 分支优先级更高
+```
+
+#### 2.4.4 关键源码佐证
+
+`server/src/services/auth.service.ts:244-268` 中的判断顺序是唯一依据：
+```typescript
+const shareKey = (headers[ImmichHeader.SharedLinkKey] || queryParams[ImmichQuery.SharedLinkKey]) as string;
+const shareSlug = (headers[ImmichHeader.SharedLinkSlug] || queryParams[ImmichQuery.SharedLinkSlug]) as string;
+const session = (headers[ImmichHeader.UserToken] ||       // x-immich-user-token
+  headers[ImmichHeader.SessionToken] ||                   // x-immich-session-token
+  queryParams[ImmichQuery.SessionKey] ||                  // sessionKey
+  this.getBearerToken(headers) ||                          // Authorization: Bearer
+  this.getCookieToken(headers)) as string;                 // Cookie: immich_access_token
+const apiKey = (headers[ImmichHeader.ApiKey] || queryParams[ImmichQuery.ApiKey]) as string;  // x-api-key / apiKey
+
+if (shareKey) return validateSharedLinkKey(shareKey);     // 优先级1
+if (shareSlug) return validateSharedLinkSlug(shareSlug); // 优先级2
+if (session) return validateSession(session, headers);   // 优先级3
+if (apiKey) return validateApiKey(apiKey);               // 优先级4
+```
+
+**Session 凭证来源（与源码完全一致）**:
+1. Header: `x-immich-user-token`
+2. Header: `x-immich-session-token`
+3. Query: `sessionKey`
+4. Header: `Authorization: Bearer <token>`
+5. Cookie: `immich_access_token`
+
+**API Key 凭证来源（与源码完全一致）**:
+1. Header: `x-api-key`
+2. Query: `apiKey`
+
+**重要结论**: Session 的判断永远在 API Key 之前，只要上述 5 种 Session 凭证中任意一种存在（且不为空），API Key 就不会被处理。
+
 ---
 
 ## 三、Scope 解析阶段
