@@ -43,6 +43,7 @@ Immich 移动端备份系统采用了"双层上传 + 三阶段确认"架构设�
 | 组件 | 文件路径 | 核心职责 |
 |------|---------|---------|
 | `WebsocketNotifier` | `mobile/lib/providers/websocket.provider.dart` | WebSocket 连接管理、事件批处理防抖 |
+| `Debouncer` | `mobile/lib/utils/debounce.dart` | 通用防抖器，支持最大等待时间 |
 
 ---
 
@@ -273,9 +274,305 @@ SyncStreamService.sync()
 
 ---
 
-## 5. 失败恢复机制
+## 5. WebSocket 批事件并发边界深度分析
 
-### 5.1 失败分类与停止条件
+### 5.1 防抖器核心实现分析
+
+**Debouncer 类** (`debounce.dart:1-64`):
+
+```dart
+class Debouncer {
+  Debouncer({required this.interval, this.maxWaitTime});
+  
+  final Duration interval;
+  final Duration? maxWaitTime;
+  Timer? _timer;
+  FutureOr<void> Function()? _lastAction;  // ⚠️ 只保存最后一个 action
+  DateTime? _lastActionTime;
+  Future<void>? _actionFuture;
+
+  void run(FutureOr<void> Function() action) {
+    _lastAction = action;  // ⚠️ 每次调用覆盖之前的 action
+    _timer?.cancel();      // ⚠️ 取消之前的 timer
+
+    if (maxWaitTime != null &&
+        (_lastActionTime == null || 
+         DateTime.now().difference(_lastActionTime!) > maxWaitTime!)) {
+      _callAndRest();  // 超过最大等待时间立即执行
+      return;
+    }
+    _timer = Timer(interval, _callAndRest);  // 设置新 timer
+  }
+
+  void _callAndRest() {
+    _lastActionTime = DateTime.now();
+    final action = _lastAction;
+    _lastAction = null;  // 清空，防止重复执行
+
+    final result = action!();
+    if (result is Future) {
+      _actionFuture = result.whenComplete(() {
+        _actionFuture = null;
+      });
+    }
+    _timer = null;
+  }
+}
+```
+
+**关键特性**：
+1. **单 Action 保存**：`_lastAction` 只保存最后一个传入的 action
+2. **Timer 取消重设**：每次 `run()` 取消之前的 timer，设置新的 timer
+3. **最大等待时间**：超过 `maxWaitTime` 立即执行，防止无限延迟
+4. **异步 Future 追踪**：`_actionFuture` 保存当前执行中的 Future
+
+### 5.2 WebSocket 批处理链路完整分析
+
+**共享资源问题** (`websocket.provider.dart:53,173,178`):
+```dart
+final List<dynamic> _batchedAssetUploadReady = [];  // ⚠️ V1 和 V2 共享同一个队列！
+
+void _handleSyncAssetUploadReadyV1(dynamic data) {
+  _batchedAssetUploadReady.add(data);  // 加入共享队列
+  _batchDebouncer.run(_processBatchedAssetUploadReadyV1);  // 触发 V1 处理
+}
+
+void _handleSyncAssetUploadReadyV2(dynamic data) {
+  _batchedAssetUploadReady.add(data);  // 加入同一个共享队列
+  _batchDebouncer.run(_processBatchedAssetUploadReadyV2);  // 触发 V2 处理
+}
+```
+
+**批处理执行** (`websocket.provider.dart:190-230`):
+```dart
+void _processBatchedAssetUploadReadyV1() {
+  if (_batchedAssetUploadReady.isEmpty) return;
+
+  try {
+    unawaited(
+      _ref.read(backgroundSyncProvider).syncWebsocketBatchV1(
+        _batchedAssetUploadReady.toList()  // 快照当前队列
+      ).then((_) {
+        if (isSyncAlbumEnabled) {
+          _ref.read(backgroundSyncProvider).syncLinkedAlbum();
+        }
+      }),
+    );
+  } catch (error) {
+    _log.severe("Error processing batched AssetUploadReadyV1 events: $error");
+  }
+
+  _batchedAssetUploadReady.clear();  // ⚠️ 立即清空，不等待异步任务完成
+}
+```
+
+**任务合并逻辑** (`background_sync.dart:189-207`):
+```dart
+Future<void> syncWebsocketBatchV1(List<dynamic> batchData) {
+  if (_syncWebsocketTask != null) {
+    return _syncWebsocketTask!.future;  // ⚠️ 上一批未完成，直接返回，丢弃新数据
+  }
+  _syncWebsocketTask = _handleWsAssetUploadReadyV1Batch(batchData);
+  return _syncWebsocketTask!.whenComplete(() {
+    _syncWebsocketTask = null;
+  });
+}
+
+// ⚠️ V1 和 V2 共享同一个 _syncWebsocketTask 变量！
+Future<void> syncWebsocketBatchV2(List<dynamic> batchData) {
+  if (_syncWebsocketTask != null) {
+    return _syncWebsocketTask!.future;  // V1 正在执行时，V2 数据被丢弃
+  }
+  _syncWebsocketTask = _handleWsAssetUploadReadyV2Batch(batchData);
+  return _syncWebsocketTask!.whenComplete(() {
+    _syncWebsocketTask = null;
+  });
+}
+```
+
+### 5.3 并发场景 1：上一批未完成时新批到达
+
+**触发条件**：
+- 批处理 A 正在执行（`_syncWebsocketTask != null`）
+- 新事件 X、Y 到达，加入 `_batchedAssetUploadReady`
+- 防抖触发，调用 `_processBatchedAssetUploadReadyV1()`
+
+```
+时序图：
+T0: 批处理 A 开始执行 → _syncWebsocketTask = futureA
+T1: 新事件 X、Y 到达 → _batchedAssetUploadReady = [X, Y]
+T2: 防抖触发 → _processBatchedAssetUploadReadyV1() 被调用
+T3: syncWebsocketBatchV1([X, Y]) 被调用
+    → 检测到 _syncWebsocketTask != null
+    → 直接返回 futureA，**丢弃 [X, Y]**
+T4: _batchedAssetUploadReady.clear() → 队列清空
+T5: futureA 完成 → _syncWebsocketTask = null
+
+结果：事件 X、Y 被永久丢失！
+```
+
+**保护点**：
+- ✅ 无保护！直接丢弃新数据
+- ✅ 最终由全量同步兜底
+
+**缺口**：
+- ❌ 新事件被静默丢弃，无日志、无重试
+- ❌ 队列在异步任务开始前就被清空
+- ❌ V1 和 V2 互相阻塞（共享同一个 `_syncWebsocketTask`）
+
+### 5.4 并发场景 2：V1/V2 事件交替到达
+
+**触发条件**：
+- V1 事件到达 → 加入队列 → `run(V1_handler)`
+- 5s 内 V2 事件到达 → 加入同一队列 → `run(V2_handler)`
+- 防抖 timer 触发
+
+```
+时序图：
+T0: V1 事件 A 到达
+    → _batchedAssetUploadReady = [A]
+    → _batchDebouncer.run(V1_handler)
+    → _lastAction = V1_handler, timer = 5s
+T1: (2s 后) V2 事件 B 到达
+    → _batchedAssetUploadReady = [A, B]
+    → _batchDebouncer.run(V2_handler)
+    → _lastAction = V2_handler (覆盖 V1_handler!), timer 重置为 5s
+T2: (5s 后) timer 触发
+    → _callAndRest() 执行 V2_handler
+    → _processBatchedAssetUploadReadyV2() 被调用
+    → 传入队列 [A, B] 给 syncWebsocketBatchV2()
+    → V2 处理器尝试解析 V1 事件 A → 类型不匹配 → 跳过
+
+结果：V1 事件 A 被 V2 处理器处理，可能被静默跳过！
+```
+
+**保护点**：
+- ✅ `handleWsAssetUploadReadyV2Batch()` 有类型检查，不匹配的事件会被 `continue` 跳过
+- ✅ 最终由全量同步兜底
+
+**缺口**：
+- ❌ V1 和 V2 事件共享同一个队列，可能混合
+- ❌ 防抖器的 `_lastAction` 被覆盖，导致事件类型与处理器不匹配
+- ❌ 跳过的事件无日志、无重试
+
+### 5.5 并发场景 3：防抖器最大等待时间触发
+
+**触发条件**：
+- 事件持续以 < 5s 的间隔到达
+- 累计超过 10s（`maxWaitTime`）
+
+```
+时序图：
+T0: 事件 A 到达 → run(V1_handler) → _lastActionTime = T0, timer = 5s
+T3: (3s 后) 事件 B 到达 → run(V1_handler) → timer 重置为 5s
+T6: (3s 后) 事件 C 到达 → run(V1_handler) → timer 重置为 5s
+T9: (3s 后) 事件 D 到达 → run(V1_handler)
+    → 检测到 DateTime.now() - _lastActionTime (T0) > 10s
+    → 立即调用 _callAndRest()，执行批处理
+    → 队列 [A, B, C, D] 被处理
+
+结果：最大等待时间防止无限延迟，正确触发批处理
+```
+
+**保护点**：
+- ✅ `maxWaitTime` 机制确保不会无限延迟
+- ✅ 队列中的所有事件被一次性处理
+
+### 5.6 并发场景 4：批处理失败
+
+**触发条件**：
+- 批处理执行过程中抛出异常
+
+```dart
+Future<void> handleWsAssetUploadReadyV1Batch(List<dynamic> batchData) async {
+  try {
+    for (final data in batchData) {
+      // 解析和处理...
+    }
+    if (assets.isNotEmpty) {
+      await _syncStreamRepository.updateAssetsV1(assets);
+      await _syncStreamRepository.updateAssetsExifV1(exifs);
+    }
+  } catch (error, stackTrace) {
+    _logger.severe("Error processing batch", error, stackTrace);
+    // ⚠️ 异常被捕获后，没有重试机制
+  }
+}
+```
+
+**保护点**：
+- ✅ 异常被捕获，不会崩溃应用
+- ✅ `_syncWebsocketTask` 在 `whenComplete` 中被置空，不会永久阻塞
+
+**缺口**：
+- ❌ 失败的批次没有重试机制
+- ❌ 失败的事件永久丢失（除非全量同步）
+- ❌ 部分成功部分失败的场景没有处理（例如前 5 个成功，第 6 个失败，后 4 个未处理）
+
+### 5.7 对失败恢复的影响
+
+| 并发问题 | 失败恢复影响 | 兜底机制 |
+|---------|-------------|---------|
+| 上一批未完成时新批被丢弃 | 新事件丢失，直到下次全量同步 | 全量 sync |
+| V1/V2 交替到达导致类型不匹配 | 部分事件被跳过，直到下次全量同步 | 全量 sync |
+| 批处理异常失败 | 整批事件丢失，直到下次全量同步 | 全量 sync |
+| 部分成功部分失败 | 未处理的事件丢失，直到下次全量同步 | 全量 sync |
+
+**关键结论**：WebSocket 批事件的所有并发问题最终都依赖**全量同步**来兜底。如果用户长时间不重启应用（不触发全量同步），这些事件可能永久丢失，导致备份状态显示"未完成"但实际上传已成功。
+
+### 5.8 对状态最终一致性的影响
+
+**一致性模型**：最终一致性（Eventual Consistency）
+- **收敛时间**：取决于全量同步触发频率（应用启动时）
+- **不一致窗口**：从事件丢失到下次全量同步的时间
+- **用户感知**：备份计数显示不准确，可能显示"还有 X 项待备份"但实际上已全部上传成功
+
+**不一致场景链**：
+```
+1. 用户上传 100 张照片
+   ↓
+2. HTTP 全部成功 → 内存 backupCount = 100
+   ↓
+3. WebSocket 推送 100 个 AssetUploadReady 事件
+   ↓
+4. 并发场景触发 → 丢失 20 个事件
+   ↓
+5. remote_asset_entity 只有 80 条记录
+   ↓
+6. getBackupStatus() 查询显示 remainderCount = 20
+   ↓
+7. 用户看到"还有 20 项待备份"，困惑为什么一直在"上传"
+   ↓
+8. 用户重启应用 → 全量同步 → 补全 20 条记录 → 状态对齐
+```
+
+### 5.9 现有保护点总结
+
+| 保护机制 | 位置 | 作用 |
+|---------|------|------|
+| `_syncWebsocketTask` 单任务 | `background_sync.dart:190-207` | 防止并发写入数据库（但会丢弃新数据） |
+| `maxWaitTime` 最大等待 | `debounce.dart:20-24` | 防止批处理无限延迟 |
+| 类型检查 `continue` | `sync_stream.service.dart:340-358` | 防止类型不匹配导致崩溃 |
+| try-catch 异常捕获 | `sync_stream.service.dart:338-368` | 防止批处理失败导致应用崩溃 |
+| `onConflict: DoUpdate` | `sync_stream.repository.dart:215` | 重复写入时更新而非报错 |
+| 全量同步兜底 | `background_sync.dart:160-187` | 应用启动时补全所有缺失数据 |
+
+### 5.10 缺口总结
+
+| 缺口 | 风险 | 严重程度 |
+|------|------|---------|
+| 新批数据静默丢弃 | 事件永久丢失（直到全量同步） | ⚠️ 中 |
+| V1/V2 共享队列和任务变量 | 事件类型与处理器不匹配 | ⚠️ 中 |
+| 批处理失败无重试 | 整批事件丢失 | ⚠️ 中 |
+| 部分成功无断点续处理 | 部分事件丢失 | ⚠️ 低 |
+| 无事件持久化队列 | 应用重启后丢失未处理事件 | ⚠️ 低（全量同步兜底） |
+| 无丢弃事件日志 | 问题难以排查 | ⚠️ 低 |
+
+---
+
+## 6. 失败恢复机制
+
+### 6.1 失败分类与停止条件
 
 | 失败类型 | 触发条件 | 停止队列？ | 处理策略 |
 |---------|---------|-----------|---------|
@@ -318,7 +615,7 @@ Future<void> worker() async {
 
 > **重要校正**：之前的分析错误地认为文件过大 (413) 会停止队列，实际上只有"配额超限"会停止整个上传队列。文件过大、网络错误等都只影响单个资产。
 
-### 5.2 前台上传失败处理
+### 6.2 前台上传失败处理
 
 **失败回调** (`drift_backup.provider.dart:345-374`):
 ```dart
@@ -341,7 +638,7 @@ void _handleForegroundBackupError(String localAssetId, String errorMessage) {
 - ✅ 用户手动重新触发备份时，已成功的资产通过 checksum 去重不会重复上传
 - ✅ 失败的资产会被重新尝试上传
 
-### 5.3 后台上传重试机制
+### 6.3 后台上传重试机制
 
 **任务配置** (`background_upload.service.dart:424-441`):
 ```dart
@@ -370,7 +667,7 @@ void _handleTaskStatusUpdate(TaskStatusUpdate update) async {
 
 > **重要发现**：后台上传成功后，除了 Live Photo 需要触发第二阶段上传外，普通资产不会更新任何本地状态。所有状态更新完全依赖 WebSocket 事件或全量同步。
 
-### 5.4 断点续传能力
+### 6.4 断点续传能力
 
 | 能力 | 支持情况 | 说明 |
 |------|---------|------|
@@ -403,9 +700,9 @@ Future<List<LocalAsset>> getCandidates(String userId, {bool onlyHashed = true}) 
 
 ---
 
-## 6. 前后端状态对齐机制
+## 7. 前后端状态对齐机制
 
-### 6.1 状态对齐架构
+### 7.1 状态对齐架构
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────┐
@@ -435,16 +732,16 @@ Future<List<LocalAsset>> getCandidates(String userId, {bool onlyHashed = true}) 
 └───────────────────────────────────────────────────────────────────────────┘
 ```
 
-### 6.2 四重状态对齐机制
+### 7.2 四重状态对齐机制
 
-| 对齐机制 | 触发时机 | 覆盖范围 | 延迟 |
-|---------|---------|---------|------|
-| **HTTP 回调乐观更新** | 每个资产上传成功 | 内存计数 | 即时 |
-| **WebSocket 批处理** | 服务端处理完成后推送 | 远程资产表 | 5-10s（防抖） |
-| **全量同步** | 应用启动 / 手动触发 | 全量远程数据 | 分钟级 |
-| **备份统计查询** | 备份页面打开 / 刷新 | 重新计算所有计数 | 即时 |
+| 对齐机制 | 触发时机 | 覆盖范围 | 延迟 | 可靠性 |
+|---------|---------|---------|------|-------|
+| **HTTP 回调乐观更新** | 每个资产上传成功 | 内存计数 | 即时 | ⚠️ 不可靠（可能与数据库不一致） |
+| **WebSocket 批处理** | 服务端处理完成后推送 | 远程资产表 | 5-10s（防抖） | ⚠️ 中等（并发场景可能丢失） |
+| **全量同步** | 应用启动 / 手动触发 | 全量远程数据 | 分钟级 | ✅ 可靠 |
+| **备份统计查询** | 备份页面打开 / 刷新 | 重新计算所有计数 | 即时 | ✅ 可靠 |
 
-### 6.3 本地数据库表结构
+### 7.3 本地数据库表结构
 
 **local_asset_entity** - 本地资产清单（无备份状态字段）
 - `id`: 本地资产唯一标识
@@ -464,7 +761,7 @@ Future<List<LocalAsset>> getCandidates(String userId, {bool onlyHashed = true}) 
 **local_album_entity** - 相册配置
 - `backupSelection`: `selected` / `excluded` / `none`
 
-### 6.4 状态查询 API
+### 7.4 状态查询 API
 
 `backup.repository.dart:39-82` 单 SQL 查询获取所有统计：
 ```sql
@@ -495,7 +792,7 @@ AND NOT EXISTS (
 
 > **关键发现**：`DriftBackupState.backupCount` 是内存维护的增量计数器，而 `getBackupStatus()` 返回的是数据库查询结果。两者可能在 HTTP 成功后、WebSocket 落库前出现短暂不一致。
 
-### 6.5 一致性保障机制
+### 7.5 一致性保障机制
 
 1. **Checksum 作为事实关联键**
    - 上传前计算本地文件 checksum
@@ -519,9 +816,9 @@ AND NOT EXISTS (
 
 ---
 
-## 7. Live Photo 特殊处理
+## 8. Live Photo 特殊处理
 
-### 7.1 两阶段上传
+### 8.1 两阶段上传
 
 iOS Live Photo 包含照片 + 视频两个文件，需分开上传：
 
@@ -541,7 +838,7 @@ iOS Live Photo 包含照片 + 视频两个文件，需分开上传：
   上传照片，关联视频 ID（priority=0, 最高优先级）
 ```
 
-### 7.2 任务分组与优先级
+### 8.2 任务分组与优先级
 
 `background_upload.service.dart:274-283`:
 ```dart
@@ -566,9 +863,9 @@ Future<int> cancel() async {
 
 ---
 
-## 8. 网络条件适配
+## 9. 网络条件适配
 
-### 8.1 WiFi / 蜂窝网络控制
+### 9.1 WiFi / 蜂窝网络控制
 
 `foreground_upload.service.dart:457-467`:
 ```dart
@@ -595,7 +892,7 @@ await _executeWithWorkerPool<LocalAsset>(
 );
 ```
 
-### 8.2 后台上传网络约束
+### 9.2 后台上传网络约束
 
 `background_upload.service.dart:437`:
 ```dart
@@ -609,9 +906,9 @@ iOS URLSession 会自动遵守此约束，在不满足网络条件时暂停。
 
 ---
 
-## 9. 取消机制
+## 10. 取消机制
 
-### 9.1 前台上传取消
+### 10.1 前台上传取消
 
 `drift_backup.provider.dart:281-286`:
 ```dart
@@ -629,7 +926,7 @@ void stopForegroundBackup() {
 3. 抛出 `RequestAbortedException` 终止当前上传
 4. Worker 池检测到 `cancelToken.isCompleted` 退出循环
 
-### 9.2 后台上传取消
+### 10.2 后台上传取消
 
 `background_upload.service.dart:195-204`:
 ```dart
@@ -647,9 +944,9 @@ Future<int> cancel() async {
 
 ---
 
-## 10. 各组件衔接关系全景
+## 11. 各组件衔接关系全景
 
-### 10.1 完整数据流图
+### 11.1 完整数据流图
 
 ```
 用户触发备份
@@ -742,7 +1039,7 @@ Future<int> cancel() async {
                                     ▼  [ 状态最终一致 ]
 ```
 
-### 10.2 失败恢复边界
+### 11.2 失败恢复边界
 
 ```
 前台上传失败
@@ -759,10 +1056,12 @@ Future<int> cancel() async {
     ├─ 应用重启后可查询 pending tasks
     └─ 调用 resume() 继续
 
-WebSocket 事件丢失
+WebSocket 批事件丢失
     │
-    ├─ 下次全量同步时补全
-    └─ 备份页面刷新时重新统计
+    ├─ 并发场景：上一批未完成时新批被丢弃
+    ├─ 并发场景：V1/V2 交替到达类型不匹配
+    ├─ 并发场景：批处理异常失败
+    └─ 下次全量同步时补全
 
 应用冷启动
     │
@@ -773,9 +1072,9 @@ WebSocket 事件丢失
 
 ---
 
-## 11. 总结
+## 12. 总结
 
-### 11.1 设计亮点
+### 12.1 设计亮点
 
 1. **双层上传架构**：前台并发 + 后台保活，兼顾速度和可靠性
 2. **Checksum 关联机制**：无需保存上传记录，通过文件哈希自然去重
@@ -783,16 +1082,22 @@ WebSocket 事件丢失
 4. **滑动窗口速度计算**：平滑的上传速度和剩余时间估算
 5. **Live Photo 优雅处理**：两阶段上传，高优先级确保完整性
 6. **任务隔离执行**：使用 Isolate 避免阻塞 UI 线程
+7. **最大等待时间防抖**：防止批处理无限延迟
 
-### 11.2 可改进点
+### 12.2 可改进点
 
 1. **缺乏真正的断点续传**：大文件上传失败需重新开始
 2. **失败资产无持久化队列**：应用重启后丢失失败记录
 3. **内存计数与数据库查询不一致**：HTTP 成功后到 WebSocket 落库前存在时间窗口
 4. **并发数固定**：未根据网络条件动态调整并发数
 5. **前台上传无自动重试**：网络临时故障导致的失败需用户手动重试
+6. **WebSocket 批事件并发安全问题**：
+   - V1/V2 共享队列和任务变量，可能导致事件丢失
+   - 上一批未完成时新批被静默丢弃
+   - 批处理失败无重试机制
+   - 部分成功部分失败无断点续处理
 
-### 11.3 关键校正点
+### 12.3 关键校正点
 
 | 校正项 | 之前结论 | 校正后结论 |
 |--------|---------|-----------|
@@ -800,8 +1105,17 @@ WebSocket 事件丢失
 | HTTP 成功后是否写入数据库 | 是 | ❌ 否，只更新内存计数，数据库写入依赖 Sync Stream |
 | 后台上传成功后是否更新状态 | 是 | ❌ 否，除 Live Photo 外，普通资产不更新任何状态 |
 | backupCount 来源 | 数据库查询 | ❌ 内存增量计数器，非数据库查询结果 |
+| WebSocket 批处理并发安全 | 未提及 | ❌ 存在多个并发边界问题，可能导致事件丢失 |
 
-### 11.4 关键文件速查
+### 12.4 WebSocket 并发边界关键结论
+
+1. **上一批未完成时新批会被静默丢弃**：`_syncWebsocketTask` 非空时直接返回现有 future，新数据被丢弃，队列同时被清空
+2. **V1/V2 事件互相阻塞**：共享同一个 `_syncWebsocketTask` 变量，V1 执行时 V2 事件被丢弃，反之亦然
+3. **V1/V2 共享队列可能导致类型不匹配**：交替到达时，最后一个处理器会处理混合队列，不匹配的事件被静默跳过
+4. **所有并发问题最终依赖全量同步兜底**：如果用户长时间不重启应用，事件可能永久丢失
+5. **批处理失败无重试**：异常被捕获后没有重试机制，整批事件丢失
+
+### 12.5 关键文件速查
 
 | 功能 | 文件 | 行号范围 |
 |------|------|---------|
@@ -815,3 +1129,5 @@ WebSocket 事件丢失
 | WebSocket 批处理 | `websocket.provider.dart` | 43-231 |
 | 后台同步管理 | `background_sync.dart` | 1-278 |
 | 同步流落库 | `sync_stream.repository.dart` | 196-272 |
+| 防抖器实现 | `debounce.dart` | 1-64 |
+| WebSocket 并发任务控制 | `background_sync.dart` | 189-227 |
