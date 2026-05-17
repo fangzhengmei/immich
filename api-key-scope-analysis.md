@@ -73,7 +73,7 @@ private async validate({ headers, queryParams }: Omit<ValidateRequest, 'metadata
 |-------|---------|---------|---------|---------------------------|
 | **1** | `shareKey` | header `x-immich-share-key` / query `shareKey` | 只要存在就走此分支 | ❌ API Key 完全被绕过，不会触发 Scope 检查 |
 | **2** | `shareSlug` | header `x-immich-share-slug` / query `shareSlug` | 只要存在且 shareKey 不存在就走此分支 | ❌ API Key 完全被绕过，不会触发 Scope 检查 |
-| **3** | `session` | header `x-api-key`/`authorization: Bearer`/Cookie/query `sessionKey` | 只要存在且 shareKey/shareSlug 不存在就走此分支 | ❌ API Key 完全被绕过，不会触发 Scope 检查 |
+| **3** | `session` | header `x-immich-user-token`/`x-immich-session-token`/`authorization: Bearer <token>`/Cookie `immich_access_token`/query `sessionKey` | 只要存在且 shareKey/shareSlug 不存在就走此分支 | ❌ API Key 完全被绕过，不会触发 Scope 检查 |
 | **4** | `apiKey` | header `x-api-key` / query `apiKey` | 上述三者都不存在时才走此分支 | ✅ 触发 API Key Scope 检查 |
 
 **关键结论**:
