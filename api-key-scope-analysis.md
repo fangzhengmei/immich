@@ -15,9 +15,9 @@ HTTP Request
     ├─ 读取路由元数据 (@Authenticated 装饰器)
     ├─ 调用 authService.authenticate()
     │   ├─ 1. 认证身份 (validate)
-    │   │   └─ validateApiKey() → 解析 API Key 及 Scope
-    │   ├─ 2. 管理员路由检查
-    │   ├─ 3. 共享链接路由检查
+    │   │   └─ 按优先级判定凭证类型 → 解析对应信息
+    │   ├─ 2. 管理员路由检查 (adminRoute)
+    │   ├─ 3. 共享链接路由检查 (sharedLinkRoute)
     │   └─ 4. API Key Scope 权限检查 (isGranted)
     └─ 注入 AuthDto 到 Request
     ↓
@@ -25,16 +25,78 @@ HTTP Request
     ↓
 [Service] 业务逻辑
     └─ 资源级访问控制 (requireAccess / checkAccess)
-        └─ 检查具体资源所有权/共享关系
+        ├─ sharedLink 分支: checkSharedLinkAccess
+        └─ 其他分支: checkOtherAccess
     ↓
 返回结果 / 抛出异常
 ```
 
 ---
 
-## 二、Scope 解析阶段
+## 二、多凭证并存时认证优先级
 
-### 2.1 API Key 认证流程
+### 2.1 凭证判定顺序与短路机制
+
+**核心代码**: `server/src/services/auth.service.ts:244-271`
+
+```typescript
+private async validate({ headers, queryParams }: Omit<ValidateRequest, 'metadata'>): Promise<AuthDto> {
+  const shareKey = (headers[ImmichHeader.SharedLinkKey] || queryParams[ImmichQuery.SharedLinkKey]) as string;
+  const shareSlug = (headers[ImmichHeader.SharedLinkSlug] || queryParams[ImmichQuery.SharedLinkSlug]) as string;
+  const session = (headers[ImmichHeader.UserToken] ||
+    headers[ImmichHeader.SessionToken] ||
+    queryParams[ImmichQuery.SessionKey] ||
+    this.getBearerToken(headers) ||
+    this.getCookieToken(headers)) as string;
+  const apiKey = (headers[ImmichHeader.ApiKey] || queryParams[ImmichQuery.ApiKey]) as string;
+
+  if (shareKey) {
+    return this.validateSharedLinkKey(shareKey);    // 优先级1: 共享链接 Key
+  }
+  if (shareSlug) {
+    return this.validateSharedLinkSlug(shareSlug);  // 优先级2: 共享链接 Slug
+  }
+  if (session) {
+    return this.validateSession(session, headers);  // 优先级3: Session
+  }
+  if (apiKey) {
+    return this.validateApiKey(apiKey);             // 优先级4: API Key
+  }
+
+  throw new UnauthorizedException('Authentication required');
+}
+```
+
+### 2.2 优先级与短路关系详解
+
+| 优先级 | 凭证类型 | 提取来源 | 短路条件 | 对 API Key Scope 检查的影响 |
+|-------|---------|---------|---------|---------------------------|
+| **1** | `shareKey` | header `x-immich-share-key` / query `shareKey` | 只要存在就走此分支 | ❌ API Key 完全被绕过，不会触发 Scope 检查 |
+| **2** | `shareSlug` | header `x-immich-share-slug` / query `shareSlug` | 只要存在且 shareKey 不存在就走此分支 | ❌ API Key 完全被绕过，不会触发 Scope 检查 |
+| **3** | `session` | header `x-api-key`/`authorization: Bearer`/Cookie/query `sessionKey` | 只要存在且 shareKey/shareSlug 不存在就走此分支 | ❌ API Key 完全被绕过，不会触发 Scope 检查 |
+| **4** | `apiKey` | header `x-api-key` / query `apiKey` | 上述三者都不存在时才走此分支 | ✅ 触发 API Key Scope 检查 |
+
+**关键结论**:
+1. **优先级是固定的**：shareKey > shareSlug > session > apiKey，高优先级凭证存在时直接短路返回
+2. **API Key Scope 检查仅在第4层触发**：只要前面任何凭证存在，无论 API Key 是否提供，都不会走 API Key 分支
+3. **多凭证并存的隐患**：如果请求同时携带 session cookie 和 API Key，实际认证的是 session，API Key 被完全忽略
+
+### 2.3 不同凭证类型的 AuthDto 结构差异
+
+| 凭证类型 | `authDto.user` | `authDto.apiKey` | `authDto.session` | `authDto.sharedLink` |
+|---------|---------------|------------------|-------------------|---------------------|
+| shareKey | ✅ 存在 | ❌ 不存在 | ❌ 不存在 | ✅ 存在 |
+| shareSlug | ✅ 存在 | ❌ 不存在 | ❌ 不存在 | ✅ 存在 |
+| session | ✅ 存在 | ❌ 不存在 | ✅ 存在 | ❌ 不存在 |
+| apiKey | ✅ 存在 | ✅ 存在 (含 permissions) | ❌ 不存在 | ❌ 不存在 |
+
+**重要**: 只有 `authDto.apiKey` 存在时，才会进入 Scope 校验分支。
+
+---
+
+## 三、Scope 解析阶段
+
+### 3.1 API Key 认证流程
 
 **文件**: `server/src/services/auth.service.ts:516-527`
 
@@ -57,7 +119,7 @@ private async validateApiKey(key: string): Promise<AuthDto> {
 2. 使用 SHA256 哈希后与数据库中存储的哈希比对
 3. 验证通过后返回包含 `apiKey.permissions` 的 `AuthDto` 对象
 
-### 2.2 数据结构定义
+### 3.2 数据结构定义
 
 **DTO 定义**: `server/src/dtos/api-key.dto.ts`
 
@@ -78,9 +140,9 @@ const ApiKeyCreateSchema = z.object({
 
 ---
 
-## 三、路由限制阶段
+## 四、路由限制阶段
 
-### 3.1 @Authenticated 装饰器
+### 4.1 @Authenticated 装饰器
 
 **文件**: `server/src/middleware/auth.guard.ts:22-46`
 
@@ -96,7 +158,7 @@ export const Authenticated = (options: AuthenticatedOptions = {}): MethodDecorat
 };
 ```
 
-### 3.2 路由权限声明的三种模式
+### 4.2 路由权限声明的三种模式
 
 **模式1: 显式指定权限** (最常用)
 ```typescript
@@ -107,10 +169,10 @@ createApiKey(@Auth() auth: AuthDto, @Body() dto: ApiKeyCreateDto) {
 }
 ```
 
-**模式2: permission=false (跳过 Scope 检查)**
+**模式2: permission=false (仅跳过 Scope 检查)**
 ```typescript
 @Get('me')
-@Authenticated({ permission: false })  // 特殊值: 不进行 Scope 检查
+@Authenticated({ permission: false })  // 仅跳过 Scope 校验，adminRoute/sharedLinkRoute 仍检查
 getMyApiKey(@Auth() auth: AuthDto) {
   return this.service.getMine(auth);
 }
@@ -119,45 +181,89 @@ getMyApiKey(@Auth() auth: AuthDto) {
 **模式3: 未指定 permission (默认 = Permission.All)**
 ```typescript
 @Get('some-endpoint')
-@Authenticated({ admin: true })  // 未显式指定 permission
+@Authenticated({ admin: true })  // 未显式指定 permission，默认要求 Permission.All
 someEndpoint(@Auth() auth: AuthDto) {
   // 默认要求 Permission.All
 }
 ```
 
-### 3.3 permission=false vs permission=all 行为差异
+### 4.3 permission=false 行为修正
 
-**核心判断逻辑**: `server/src/services/auth.service.ts:186-192`
+> **重要修正**: `permission=false` **只跳过 Scope 校验**，不会跳过 `adminRoute` 与 `sharedLinkRoute` 的拦截。
+
+**核心校验流程**: `server/src/services/auth.service.ts:195-222`
 
 ```typescript
-if (
-  authDto.apiKey &&
-  requestedPermission !== false &&        // 关键: permission=false 时短路
-  !isGranted({ requested: [requestedPermission], current: authDto.apiKey.permissions })
-) {
-  throw new ForbiddenException(`Missing required permission: ${requestedPermission}`);
+async authenticate({ headers, queryParams, metadata }: ValidateRequest): Promise<AuthDto> {
+  const authDto = await this.validate({ headers, queryParams });  // 第一步: 身份认证
+  const { adminRoute, sharedLinkRoute, uri } = metadata;
+  const requestedPermission = metadata.permission ?? Permission.All;
+
+  // 检查1: 管理员路由限制 - 无论 permission 是否为 false 都会执行
+  if (!authDto.user.isAdmin && adminRoute) {
+    this.logger.warn(`Denied access to admin only route: ${uri}`);
+    throw new ForbiddenException('Forbidden');
+  }
+
+  // 检查2: 共享链接路由限制 - 无论 permission 是否为 false 都会执行
+  if (authDto.sharedLink && !sharedLinkRoute) {
+    this.logger.warn(`Denied access to non-shared route: ${uri}`);
+    throw new ForbiddenException('Forbidden');
+  }
+
+  // 检查3: API Key Scope 权限校验 - 仅当 permission !== false 时执行
+  if (
+    authDto.apiKey &&
+    requestedPermission !== false &&        // permission=false 时短路跳过此检查
+    !isGranted({ requested: [requestedPermission], current: authDto.apiKey.permissions })
+  ) {
+    throw new ForbiddenException(`Missing required permission: ${requestedPermission}`);
+  }
+
+  return authDto;
 }
 ```
+
+**permission=false 校验流程图**:
+```
+身份认证通过
+    ↓
+adminRoute 检查? → 不通过 → 403 Forbidden
+    ↓ 通过
+sharedLinkRoute 检查? → 不通过 → 403 Forbidden
+    ↓ 通过
+permission === false? → 是 → 跳过 Scope 检查，放行
+    ↓ 否
+Scope 校验 → 不通过 → 403 Forbidden
+    ↓ 通过
+放行
+```
+
+### 4.4 permission=false vs permission=all 行为差异
 
 **差异对比表**:
 
 | 维度 | `permission=false` | `permission=Permission.All` | 未指定 (默认 `= Permission.All`) |
 |-----|-------------------|----------------------------|---------------------------------|
 | `requestedPermission` 值 | `false` | `Permission.All` (`'all'`) | `Permission.All` (`'all'`) |
+| 是否检查 adminRoute | ✅ 检查 | ✅ 检查 | ✅ 检查 |
+| 是否检查 sharedLinkRoute | ✅ 检查 | ✅ 检查 | ✅ 检查 |
 | 是否触发 Scope 校验 | ❌ 不触发 | ✅ 触发 | ✅ 触发 |
 | 短路条件 | `requestedPermission !== false` → `false`，跳过 `isGranted` | 执行 `isGranted` 检查 | 执行 `isGranted` 检查 |
 | `isGranted` 判定逻辑 | - | 检查 `current` 是否包含 `'all'` | 检查 `current` 是否包含 `'all'` |
-| 放行条件 | 身份认证通过即可 | API Key 必须包含 `Permission.All` | API Key 必须包含 `Permission.All` |
-| 拒绝返回 | - | `403 Forbidden: Missing required permission: all` | `403 Forbidden: Missing required permission: all` |
+| 放行条件 (API Key) | 身份认证通过 + adminRoute 通过 + sharedLinkRoute 通过 | 身份认证通过 + adminRoute 通过 + sharedLinkRoute 通过 + API Key 含 `all` | 身份认证通过 + adminRoute 通过 + sharedLinkRoute 通过 + API Key 含 `all` |
+| 拒绝返回 (Scope) | - | `403 Forbidden: Missing required permission: all` | `403 Forbidden: Missing required permission: all` |
+| 拒绝返回 (adminRoute) | `403 Forbidden: Forbidden` | `403 Forbidden: Forbidden` | `403 Forbidden: Forbidden` |
+| 拒绝返回 (sharedLinkRoute) | `403 Forbidden: Forbidden` | `403 Forbidden: Forbidden` | `403 Forbidden: Forbidden` |
 | 适用场景 | 获取当前 API Key 自身信息等无需权限的操作 | 管理员操作、高风险操作 | 未显式声明权限的路由 |
 
-**代码佐证**: `server/src/services/auth.service.ts:171`
+**代码佐证**: `server/src/services/auth.service.ts:198`
 ```typescript
 const requestedPermission = metadata.permission ?? Permission.All;
 ```
 当 `metadata.permission` 为 `undefined` 时，默认赋值为 `Permission.All`。
 
-### 3.4 AuthGuard 守卫拦截
+### 4.5 AuthGuard 守卫拦截
 
 **文件**: `server/src/middleware/auth.guard.ts:88-109`
 
@@ -185,11 +291,11 @@ async canActivate(context: ExecutionContext): Promise<boolean> {
 
 ---
 
-## 四、权限校验阶段
+## 五、权限校验阶段
 
-### 4.1 authenticate 核心校验
+### 5.1 authenticate 核心校验
 
-**文件**: `server/src/services/auth.service.ts:218-242`
+**文件**: `server/src/services/auth.service.ts:195-222`
 
 ```typescript
 async authenticate({ headers, queryParams, metadata }: ValidateRequest): Promise<AuthDto> {
@@ -222,7 +328,7 @@ async authenticate({ headers, queryParams, metadata }: ValidateRequest): Promise
 }
 ```
 
-### 4.2 isGranted 权限判定算法
+### 5.2 isGranted 权限判定算法
 
 **文件**: `server/src/utils/access.ts:8-19`
 
@@ -247,11 +353,11 @@ export const isGranted = ({ requested, current }: GrantedRequest) => {
 
 ---
 
-## 五、资源访问判定阶段
+## 六、资源访问判定阶段
 
 路由级权限检查通过后，业务逻辑层还会进行**资源级**的访问控制，确保用户只能访问自己有权限的具体资源。
 
-### 5.1 requireAccess 强制检查
+### 6.1 requireAccess 强制检查
 
 **文件**: `server/src/utils/access.ts:37-42`
 
@@ -264,7 +370,7 @@ export const requireAccess = async (access: AccessRepository, request: AccessReq
 };
 ```
 
-### 5.2 checkAccess 资源访问检查
+### 6.2 checkAccess 资源访问检查
 
 **文件**: `server/src/utils/access.ts:44-56`
 
@@ -284,7 +390,7 @@ export const checkAccess = async (
 };
 ```
 
-### 5.3 Shared Link 分支决策表
+### 6.3 Shared Link 分支决策表
 
 当 `auth.sharedLink` 存在时，进入共享链接访问判定分支。共享链接有两个关键开关：
 - `allowDownload`: 是否允许下载
@@ -339,7 +445,7 @@ const checkSharedLinkAccess = async (
 4. `albumAsset.create` 需要同时满足 `allowUpload: true` 且相册在共享链接中
 5. 未在 switch 中列出的权限（如 `asset.delete`、`asset.update` 等）共享链接一概拒绝
 
-### 5.4 非 Shared Link 资源访问判定示例 (AssetRead)
+### 6.4 非 Shared Link 资源访问判定示例 (AssetRead)
 
 **文件**: `server/src/utils/access.ts:116-121`
 
@@ -360,17 +466,75 @@ case Permission.AssetRead: {
 
 ---
 
-## 六、拒绝返回阶段
+## 七、凭证类型 × 路由元数据 × 最终拒绝状态矩阵
 
-### 6.1 异常类型与场景
+### 7.1 矩阵说明
+
+本矩阵覆盖三种凭证类型（session、apiKey、sharedLink）在不同路由元数据配置下的拒绝返回情况。
+
+**符号说明**:
+- ✅ 放行
+- ❌ 401 Unauthorized (身份认证失败)
+- 🚫 403 Forbidden (权限不足)
+- ⚠️ 400 Bad Request (资源级访问失败)
+- N/A 不适用
+
+### 7.2 完整拒绝状态矩阵
+
+| 凭证类型 | 路由元数据配置 | 条件 | 身份认证 | adminRoute 检查 | sharedLinkRoute 检查 | Scope 检查 | 资源级检查 | 最终结果 | HTTP 状态码 |
+|---------|---------------|------|---------|----------------|---------------------|-----------|-----------|---------|------------|
+| **session** | `permission=false` | 非管理员访问 admin=true | ✅ 通过 | ❌ 不通过 | N/A (无 sharedLink) | N/A (permission=false) | 不涉及 | 🚫 拒绝 | 403 |
+| **session** | `permission=false` | 非管理员访问 admin=false | ✅ 通过 | ✅ 通过 | N/A | N/A | 正常执行 | ✅ 放行 / ⚠️ 可能拒绝 | 200 / 400 |
+| **session** | `permission=all` | 非管理员访问 admin=true | ✅ 通过 | ❌ 不通过 | N/A | N/A | 不涉及 | 🚫 拒绝 | 403 |
+| **session** | `permission=all` | 非管理员访问 admin=false | ✅ 通过 | ✅ 通过 | N/A | N/A (session 无 Scope) | 正常执行 | ✅ 放行 / ⚠️ 可能拒绝 | 200 / 400 |
+| **session** | `permission=asset.read` | 非管理员访问 admin=false | ✅ 通过 | ✅ 通过 | N/A | N/A (session 无 Scope) | 正常执行 | ✅ 放行 / ⚠️ 可能拒绝 | 200 / 400 |
+| **session** | `sharedLink=true` | session 访问共享路由 | ✅ 通过 | ✅ 通过 | N/A (无 sharedLink) | N/A | 正常执行 | ✅ 放行 / ⚠️ 可能拒绝 | 200 / 400 |
+| **session** | `sharedLink=false` | session 访问非共享路由 | ✅ 通过 | ✅ 通过 | N/A | N/A | 正常执行 | ✅ 放行 / ⚠️ 可能拒绝 | 200 / 400 |
+| **apiKey** | `permission=false` | 非管理员访问 admin=true | ✅ 通过 | ❌ 不通过 | N/A | N/A | 不涉及 | 🚫 拒绝 | 403 |
+| **apiKey** | `permission=false` | 非管理员访问 admin=false | ✅ 通过 | ✅ 通过 | N/A | N/A (permission=false) | 正常执行 | ✅ 放行 / ⚠️ 可能拒绝 | 200 / 400 |
+| **apiKey** | `permission=all` | API Key 不含 all 权限 | ✅ 通过 | ✅ 通过 | N/A | ❌ 不通过 | 不涉及 | 🚫 拒绝 | 403 |
+| **apiKey** | `permission=all` | API Key 含 all 权限 | ✅ 通过 | ✅ 通过 | N/A | ✅ 通过 | 正常执行 | ✅ 放行 / ⚠️ 可能拒绝 | 200 / 400 |
+| **apiKey** | `permission=asset.delete` | API Key 不含 asset.delete | ✅ 通过 | ✅ 通过 | N/A | ❌ 不通过 | 不涉及 | 🚫 拒绝 | 403 |
+| **apiKey** | `permission=asset.delete` | API Key 含 asset.delete | ✅ 通过 | ✅ 通过 | N/A | ✅ 通过 | 正常执行 | ✅ 放行 / ⚠️ 可能拒绝 | 200 / 400 |
+| **apiKey** | `sharedLink=true` | API Key 访问共享路由 | ✅ 通过 | ✅ 通过 | N/A (无 sharedLink) | ✅ 通过 | 正常执行 | ✅ 放行 / ⚠️ 可能拒绝 | 200 / 400 |
+| **apiKey** | `sharedLink=false` | API Key 访问非共享路由 | ✅ 通过 | ✅ 通过 | N/A | ✅ 通过 | 正常执行 | ✅ 放行 / ⚠️ 可能拒绝 | 200 / 400 |
+| **sharedLink** | `permission=false` | sharedLinkRoute=false | ✅ 通过 | ✅ 通过 | ❌ 不通过 | N/A | 不涉及 | 🚫 拒绝 | 403 |
+| **sharedLink** | `permission=false` | sharedLinkRoute=true | ✅ 通过 | ✅ 通过 | ✅ 通过 | N/A (无 apiKey) | 正常执行 | ✅ 放行 / ⚠️ 可能拒绝 | 200 / 400 |
+| **sharedLink** | `permission=asset.read` | sharedLinkRoute=false | ✅ 通过 | ✅ 通过 | ❌ 不通过 | N/A | 不涉及 | 🚫 拒绝 | 403 |
+| **sharedLink** | `permission=asset.read` | sharedLinkRoute=true, 资源在链接中 | ✅ 通过 | ✅ 通过 | ✅ 通过 | N/A | ✅ 通过 | ✅ 放行 | 200 |
+| **sharedLink** | `permission=asset.read` | sharedLinkRoute=true, 资源不在链接中 | ✅ 通过 | ✅ 通过 | ✅ 通过 | N/A | ❌ 不通过 | ⚠️ 拒绝 | 400 |
+| **sharedLink** | `permission=asset.download` | allowDownload=false | ✅ 通过 | ✅ 通过 | ✅ 通过 | N/A | ❌ 不通过 | ⚠️ 拒绝 | 400 |
+| **sharedLink** | `permission=asset.download` | allowDownload=true, 资源在链接中 | ✅ 通过 | ✅ 通过 | ✅ 通过 | N/A | ✅ 通过 | ✅ 放行 | 200 |
+| **sharedLink** | `permission=asset.upload` | allowUpload=false | ✅ 通过 | ✅ 通过 | ✅ 通过 | N/A | ❌ 不通过 | ⚠️ 拒绝 | 400 |
+| **sharedLink** | `permission=asset.upload` | allowUpload=true | ✅ 通过 | ✅ 通过 | ✅ 通过 | N/A | ✅ 通过 | ✅ 放行 | 200 |
+| **sharedLink** | `permission=asset.delete` | sharedLinkRoute=true | ✅ 通过 | ✅ 通过 | ✅ 通过 | N/A | ❌ 不通过 | ⚠️ 拒绝 | 400 |
+| **任意** | 任意 | 未提供任何凭证 | ❌ 不通过 | N/A | N/A | N/A | N/A | ❌ 拒绝 | 401 |
+| **apiKey** | 任意 | API Key 哈希不匹配 | ❌ 不通过 | N/A | N/A | N/A | N/A | ❌ 拒绝 | 401 |
+| **sharedLink** | 任意 | shareKey 无效 | ❌ 不通过 | N/A | N/A | N/A | N/A | ❌ 拒绝 | 401 |
+| **session** | 任意 | session token 无效 | ❌ 不通过 | N/A | N/A | N/A | N/A | ❌ 拒绝 | 401 |
+
+### 7.3 矩阵关键结论
+
+1. **Session 无 Scope 检查**: session 认证的请求不会触发 Scope 校验，因为 `authDto.apiKey` 不存在
+2. **Shared Link 无 Scope 检查**: sharedLink 认证的请求也不会触发 Scope 校验
+3. **adminRoute 优先级最高**: 无论 permission 如何配置，adminRoute 检查始终先执行
+4. **sharedLinkRoute 是 Shared Link 的第一道关卡**: Shared Link 访问非共享路由直接 403
+5. **资源级检查是最后一道防线**: 即使所有路由级检查通过，资源级检查仍可能返回 400
+6. **401 只发生在身份认证阶段**: 凭证无效或缺失时才返回 401
+
+---
+
+## 八、拒绝返回阶段
+
+### 8.1 异常类型与场景
 
 | 异常类型 | HTTP 状态码 | 触发场景 |
 |---------|------------|----------|
-| `UnauthorizedException` | 401 | API Key 无效、未提供认证信息 |
+| `UnauthorizedException` | 401 | API Key 无效、未提供认证信息、session 无效、shareKey 无效 |
 | `ForbiddenException` | 403 | 权限不足（Scope 不匹配、非管理员访问管理员路由、共享链接访问非共享路由） |
-| `BadRequestException` | 400 | 资源不存在或无访问权限（资源级检查失败） |
+| `BadRequestException` | 400 | 资源不存在或无访问权限（资源级检查失败、allowDownload=false、allowUpload=false） |
 
-### 6.2 拒绝返回示例
+### 8.2 拒绝返回示例
 
 **场景1: API Key 无效**
 ```
@@ -402,13 +566,13 @@ Status: 403 Forbidden
 }
 ```
 
-**场景4: 资源级访问被拒**
+**场景4: permission=false 但非管理员访问 admin 路由**
 ```
-Status: 400 Bad Request
+Status: 403 Forbidden
 {
-  "message": "Not found or no asset.read access",
-  "error": "Bad Request",
-  "statusCode": 400
+  "message": "Forbidden",
+  "error": "Forbidden",
+  "statusCode": 403
 }
 ```
 
@@ -422,7 +586,17 @@ Status: 403 Forbidden
 }
 ```
 
-**场景6: Shared Link allowDownload=false 时下载被拒**
+**场景6: 资源级访问被拒**
+```
+Status: 400 Bad Request
+{
+  "message": "Not found or no asset.read access",
+  "error": "Bad Request",
+  "statusCode": 400
+}
+```
+
+**场景7: Shared Link allowDownload=false 时下载被拒**
 ```
 Status: 400 Bad Request
 {
@@ -434,9 +608,9 @@ Status: 400 Bad Request
 
 ---
 
-## 七、API Key 自限制机制
+## 九、API Key 自限制机制
 
-### 7.1 创建时的权限限制
+### 9.1 创建时的权限限制
 
 **文件**: `server/src/services/api-key.service.ts:15-17`
 
@@ -448,7 +622,7 @@ if (auth.apiKey && !isGranted({ requested: dto.permissions, current: auth.apiKey
 
 **安全特性**: 使用 API Key 创建新的 API Key 时，新 Key 的权限不能超过当前 Key 的权限，防止权限逃逸。
 
-### 7.2 更新时的权限限制
+### 9.2 更新时的权限限制
 
 **文件**: `server/src/services/api-key.service.ts:35-41`
 
@@ -464,46 +638,48 @@ if (
 
 ---
 
-## 八、关键设计总结
+## 十、关键设计总结
 
-### 8.1 安全设计亮点
+### 10.1 安全设计亮点
 
 1. **分层防御**: 路由级 Scope 检查 + 资源级所有权检查，形成纵深防御
 2. **最小权限原则**: 默认不授予权限，需显式声明
 3. **权限不可提升**: API Key 创建子 Key 时无法超越自身权限
 4. **哈希存储**: API Key 采用 SHA256 哈希存储，泄露后无法还原
 5. **细粒度控制**: 支持 50+ 种细分权限，可精确控制 API 访问范围
-6. **灵活的权限声明**: 支持 `permission=false` 跳过检查，适用于特殊场景
+6. **灵活的权限声明**: 支持 `permission=false` 跳过 Scope 检查，适用于特殊场景
+7. **凭证优先级固定**: 避免凭证优先级不确定导致的安全漏洞
 
-### 8.2 核心数据流向
+### 10.2 核心数据流向
 
 ```
 请求 → [AuthGuard] 读取路由权限元数据
-     → [authService.validateApiKey] 解析 Key 及 Scope
-     → [authService.authenticate] Scope 与路由要求比对
+     → [authService.validate] 按优先级判定凭证类型
+     → [authService.authenticate] adminRoute → sharedLinkRoute → Scope 检查
      → [Controller] 执行业务逻辑
-     → [checkAccess] 资源级访问控制
+     → [checkAccess] 资源级访问控制 (sharedLink 分支 / 其他分支)
      → 返回结果 / 抛出异常
 ```
 
-### 8.3 关键组件关系
+### 10.3 关键组件关系
 
 | 组件 | 职责 | 核心文件 |
 |-----|-----|---------|
 | `@Authenticated` | 声明路由权限要求 | `auth.guard.ts:22-46` |
 | `AuthGuard` | 拦截请求，触发认证 | `auth.guard.ts:78-109` |
+| `AuthService.validate` | 按优先级判定凭证类型 | `auth.service.ts:244-271` |
 | `AuthService.validateApiKey` | 解析 API Key 及 Scope | `auth.service.ts:516-527` |
-| `AuthService.authenticate` | 执行四层权限检查 | `auth.service.ts:218-242` |
+| `AuthService.authenticate` | 执行四层权限检查 | `auth.service.ts:195-222` |
 | `isGranted` | Scope 权限判定算法 | `access.ts:13-19` |
 | `checkSharedLinkAccess` | Shared Link 资源访问控制 | `access.ts:58-98` |
 | `checkOtherAccess` | 非 Shared Link 资源访问控制 | `access.ts:100-335` |
 | `checkAccess` | 资源级访问控制入口 | `access.ts:44-56` |
 
-### 8.4 权限检查失败速查表
+### 10.4 权限检查失败速查表
 
 | 阶段 | 检查点 | 失败条件 | 异常类型 | HTTP 状态码 |
 |-----|-------|---------|---------|------------|
-| 身份认证 | API Key 有效性 | Key 哈希不匹配 | `UnauthorizedException` | 401 |
+| 身份认证 | 凭证有效性 | 未提供凭证或凭证无效 | `UnauthorizedException` | 401 |
 | 路由检查 | 管理员路由 | 非管理员访问 `admin: true` 路由 | `ForbiddenException` | 403 |
 | 路由检查 | 共享链接路由 | Shared Link 访问非 `sharedLink: true` 路由 | `ForbiddenException` | 403 |
 | Scope 检查 | permission=all | API Key 不含 `all` 权限 | `ForbiddenException` | 403 |
