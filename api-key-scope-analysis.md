@@ -96,41 +96,68 @@ export const Authenticated = (options: AuthenticatedOptions = {}): MethodDecorat
 };
 ```
 
-### 3.2 路由权限声明示例
+### 3.2 路由权限声明的三种模式
 
-**文件**: `server/src/controllers/api-key.controller.ts`
-
+**模式1: 显式指定权限** (最常用)
 ```typescript
 @Post()
 @Authenticated({ permission: Permission.ApiKeyCreate })  // 需要 apiKey.create 权限
 createApiKey(@Auth() auth: AuthDto, @Body() dto: ApiKeyCreateDto) {
   return this.service.create(auth, dto);
 }
+```
 
+**模式2: permission=false (跳过 Scope 检查)**
+```typescript
 @Get('me')
-@Authenticated({ permission: false })  // 特殊值: 不需要权限检查
+@Authenticated({ permission: false })  // 特殊值: 不进行 Scope 检查
 getMyApiKey(@Auth() auth: AuthDto) {
   return this.service.getMine(auth);
 }
 ```
 
-**文件**: `server/src/controllers/asset.controller.ts`
-
+**模式3: 未指定 permission (默认 = Permission.All)**
 ```typescript
-@Get(':id')
-@Authenticated({ permission: Permission.AssetRead, sharedLink: true })
-getAssetInfo(@Auth() auth: AuthDto, @Param() { id }: UUIDParamDto) {
-  return this.service.get(auth, id);
-}
-
-@Delete()
-@Authenticated({ permission: Permission.AssetDelete })
-deleteAssets(@Auth() auth: AuthDto, @Body() dto: AssetBulkDeleteDto) {
-  return this.service.deleteAll(auth, dto);
+@Get('some-endpoint')
+@Authenticated({ admin: true })  // 未显式指定 permission
+someEndpoint(@Auth() auth: AuthDto) {
+  // 默认要求 Permission.All
 }
 ```
 
-### 3.3 AuthGuard 守卫拦截
+### 3.3 permission=false vs permission=all 行为差异
+
+**核心判断逻辑**: `server/src/services/auth.service.ts:186-192`
+
+```typescript
+if (
+  authDto.apiKey &&
+  requestedPermission !== false &&        // 关键: permission=false 时短路
+  !isGranted({ requested: [requestedPermission], current: authDto.apiKey.permissions })
+) {
+  throw new ForbiddenException(`Missing required permission: ${requestedPermission}`);
+}
+```
+
+**差异对比表**:
+
+| 维度 | `permission=false` | `permission=Permission.All` | 未指定 (默认 `= Permission.All`) |
+|-----|-------------------|----------------------------|---------------------------------|
+| `requestedPermission` 值 | `false` | `Permission.All` (`'all'`) | `Permission.All` (`'all'`) |
+| 是否触发 Scope 校验 | ❌ 不触发 | ✅ 触发 | ✅ 触发 |
+| 短路条件 | `requestedPermission !== false` → `false`，跳过 `isGranted` | 执行 `isGranted` 检查 | 执行 `isGranted` 检查 |
+| `isGranted` 判定逻辑 | - | 检查 `current` 是否包含 `'all'` | 检查 `current` 是否包含 `'all'` |
+| 放行条件 | 身份认证通过即可 | API Key 必须包含 `Permission.All` | API Key 必须包含 `Permission.All` |
+| 拒绝返回 | - | `403 Forbidden: Missing required permission: all` | `403 Forbidden: Missing required permission: all` |
+| 适用场景 | 获取当前 API Key 自身信息等无需权限的操作 | 管理员操作、高风险操作 | 未显式声明权限的路由 |
+
+**代码佐证**: `server/src/services/auth.service.ts:171`
+```typescript
+const requestedPermission = metadata.permission ?? Permission.All;
+```
+当 `metadata.permission` 为 `undefined` 时，默认赋值为 `Permission.All`。
+
+### 3.4 AuthGuard 守卫拦截
 
 **文件**: `server/src/middleware/auth.guard.ts:88-109`
 
@@ -257,7 +284,62 @@ export const checkAccess = async (
 };
 ```
 
-### 5.3 资源访问判定示例 (AssetRead)
+### 5.3 Shared Link 分支决策表
+
+当 `auth.sharedLink` 存在时，进入共享链接访问判定分支。共享链接有两个关键开关：
+- `allowDownload`: 是否允许下载
+- `allowUpload`: 是否允许上传
+
+**核心代码**: `server/src/utils/access.ts:58-98`
+
+```typescript
+const checkSharedLinkAccess = async (
+  access: AccessRepository,
+  request: SharedLinkAccessRequest,
+): Promise<Set<string>> => {
+  const { sharedLink, permission, ids } = request;
+  const sharedLinkId = sharedLink.id;
+
+  switch (permission) {
+    case Permission.AssetRead: {
+      return await access.asset.checkSharedLinkAccess(sharedLinkId, ids);
+    }
+    case Permission.AssetDownload: {
+      return sharedLink.allowDownload ? await access.asset.checkSharedLinkAccess(sharedLinkId, ids) : new Set();
+    }
+    case Permission.AssetUpload: {
+      return sharedLink.allowUpload ? ids : new Set();
+    }
+    // ... 其他权限
+  }
+};
+```
+
+**Shared Link 资源访问决策表**:
+
+| 请求权限 | `allowDownload` | `allowUpload` | 判定逻辑 | 结果 | HTTP 状态 |
+|---------|----------------|--------------|---------|------|----------|
+| **asset.read** | 任意 | 任意 | 直接调用 `checkSharedLinkAccess` 检查资源是否在共享链接中 | ✅ 资源在共享链接中 → 放行<br>❌ 资源不在 → 返回空 Set | `400 Bad Request` |
+| **asset.view** | 任意 | 任意 | 直接调用 `checkSharedLinkAccess` 检查资源是否在共享链接中 | ✅ 资源在共享链接中 → 放行<br>❌ 资源不在 → 返回空 Set | `400 Bad Request` |
+| **asset.download** | `true` | 任意 | 调用 `checkSharedLinkAccess` 检查资源是否在共享链接中 | ✅ 资源在共享链接中 → 放行<br>❌ 资源不在 → 返回空 Set | `400 Bad Request` |
+| **asset.download** | `false` | 任意 | 直接返回空 Set | ❌ 全部拒绝 | `400 Bad Request` |
+| **asset.upload** | 任意 | `true` | 直接返回 `ids` (不检查共享链接资源) | ✅ 全部放行 | - |
+| **asset.upload** | 任意 | `false` | 直接返回空 Set | ❌ 全部拒绝 | `400 Bad Request` |
+| **album.read** | 任意 | 任意 | 调用 `checkSharedLinkAccess` 检查相册是否在共享链接中 | ✅ 相册在共享链接中 → 放行<br>❌ 相册不在 → 返回空 Set | `400 Bad Request` |
+| **album.download** | `true` | 任意 | 调用 `checkSharedLinkAccess` 检查相册是否在共享链接中 | ✅ 相册在共享链接中 → 放行<br>❌ 相册不在 → 返回空 Set | `400 Bad Request` |
+| **album.download** | `false` | 任意 | 直接返回空 Set | ❌ 全部拒绝 | `400 Bad Request` |
+| **albumAsset.create** | 任意 | `true` | 调用 `checkSharedLinkAccess` 检查相册是否在共享链接中 | ✅ 相册在共享链接中 → 放行<br>❌ 相册不在 → 返回空 Set | `400 Bad Request` |
+| **albumAsset.create** | 任意 | `false` | 直接返回空 Set | ❌ 全部拒绝 | `400 Bad Request` |
+| **其他权限** | 任意 | 任意 | 直接返回空 Set | ❌ 全部拒绝 | `400 Bad Request` |
+
+**决策表说明**:
+1. `asset.read` 和 `asset.view` 不受 `allowDownload`/`allowUpload` 影响，只要资源在共享链接中即可访问
+2. `asset.download` 和 `album.download` 依赖 `allowDownload: true` 开关
+3. `asset.upload` 不检查资源是否在共享链接中，只看 `allowUpload` 开关（因为是上传新资源）
+4. `albumAsset.create` 需要同时满足 `allowUpload: true` 且相册在共享链接中
+5. 未在 switch 中列出的权限（如 `asset.delete`、`asset.update` 等）共享链接一概拒绝
+
+### 5.4 非 Shared Link 资源访问判定示例 (AssetRead)
 
 **文件**: `server/src/utils/access.ts:116-121`
 
@@ -285,7 +367,7 @@ case Permission.AssetRead: {
 | 异常类型 | HTTP 状态码 | 触发场景 |
 |---------|------------|----------|
 | `UnauthorizedException` | 401 | API Key 无效、未提供认证信息 |
-| `ForbiddenException` | 403 | 权限不足（Scope 不匹配、非管理员访问管理员路由） |
+| `ForbiddenException` | 403 | 权限不足（Scope 不匹配、非管理员访问管理员路由、共享链接访问非共享路由） |
 | `BadRequestException` | 400 | 资源不存在或无访问权限（资源级检查失败） |
 
 ### 6.2 拒绝返回示例
@@ -300,7 +382,7 @@ Status: 401 Unauthorized
 }
 ```
 
-**场景2: Scope 权限不足**
+**场景2: Scope 权限不足 (asset.delete)**
 ```
 Status: 403 Forbidden
 {
@@ -310,11 +392,41 @@ Status: 403 Forbidden
 }
 ```
 
-**场景3: 资源级访问被拒**
+**场景3: 默认 permission=all 被拒绝**
+```
+Status: 403 Forbidden
+{
+  "message": "Missing required permission: all",
+  "error": "Forbidden",
+  "statusCode": 403
+}
+```
+
+**场景4: 资源级访问被拒**
 ```
 Status: 400 Bad Request
 {
   "message": "Not found or no asset.read access",
+  "error": "Bad Request",
+  "statusCode": 400
+}
+```
+
+**场景5: Shared Link 访问非共享路由**
+```
+Status: 403 Forbidden
+{
+  "message": "Forbidden",
+  "error": "Forbidden",
+  "statusCode": 403
+}
+```
+
+**场景6: Shared Link allowDownload=false 时下载被拒**
+```
+Status: 400 Bad Request
+{
+  "message": "Not found or no asset.download access",
   "error": "Bad Request",
   "statusCode": 400
 }
@@ -361,6 +473,7 @@ if (
 3. **权限不可提升**: API Key 创建子 Key 时无法超越自身权限
 4. **哈希存储**: API Key 采用 SHA256 哈希存储，泄露后无法还原
 5. **细粒度控制**: 支持 50+ 种细分权限，可精确控制 API 访问范围
+6. **灵活的权限声明**: 支持 `permission=false` 跳过检查，适用于特殊场景
 
 ### 8.2 核心数据流向
 
@@ -382,4 +495,19 @@ if (
 | `AuthService.validateApiKey` | 解析 API Key 及 Scope | `auth.service.ts:516-527` |
 | `AuthService.authenticate` | 执行四层权限检查 | `auth.service.ts:218-242` |
 | `isGranted` | Scope 权限判定算法 | `access.ts:13-19` |
-| `checkAccess` | 资源级访问控制 | `access.ts:44-335` |
+| `checkSharedLinkAccess` | Shared Link 资源访问控制 | `access.ts:58-98` |
+| `checkOtherAccess` | 非 Shared Link 资源访问控制 | `access.ts:100-335` |
+| `checkAccess` | 资源级访问控制入口 | `access.ts:44-56` |
+
+### 8.4 权限检查失败速查表
+
+| 阶段 | 检查点 | 失败条件 | 异常类型 | HTTP 状态码 |
+|-----|-------|---------|---------|------------|
+| 身份认证 | API Key 有效性 | Key 哈希不匹配 | `UnauthorizedException` | 401 |
+| 路由检查 | 管理员路由 | 非管理员访问 `admin: true` 路由 | `ForbiddenException` | 403 |
+| 路由检查 | 共享链接路由 | Shared Link 访问非 `sharedLink: true` 路由 | `ForbiddenException` | 403 |
+| Scope 检查 | permission=all | API Key 不含 `all` 权限 | `ForbiddenException` | 403 |
+| Scope 检查 | permission=xxx | API Key 不含 `xxx` 权限 | `ForbiddenException` | 403 |
+| 资源检查 | Shared Link download | `allowDownload=false` | `BadRequestException` | 400 |
+| 资源检查 | Shared Link upload | `allowUpload=false` | `BadRequestException` | 400 |
+| 资源检查 | 资源所有权 | 资源不属于用户且未被共享 | `BadRequestException` | 400 |
