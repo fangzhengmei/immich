@@ -96,8 +96,8 @@ getTimeBucket(@Auth() auth: AuthDto, @Query() dto: TimeBucketAssetDto) {
 | `visibility` | ✅ | ✅ | 按可见性筛选 |
 | `withStacked` | ✅ | ✅ | 控制堆叠资产的包含逻辑 |
 | `withPartners` | ✅ | ✅ | 控制合作伙伴资产的包含逻辑 |
-| `orderBy` | ✅ | ✅ | 决定分桶字段（takenAt/createdAt） |
-| `order` | ✅ | ✅ | 分桶列表排序方向 |
+| `orderBy` | ✅ | ✅ | **双作用**：分桶字段 + 桶内排序字段 |
+| `order` | ✅ | ✅ | **双作用**：分桶列表排序 + 单桶内资产排序 |
 | `bbox` | ✅ | ✅ | 按地理边界筛选 |
 | `withCoordinates` | ❌ | ✅ | **仅单桶有效**：控制返回 lat/lng 字段 |
 | `key` | ❌ | ❌ | DTO 中定义但后端未使用 |
@@ -111,11 +111,23 @@ getTimeBucket(@Auth() auth: AuthDto, @Query() dto: TimeBucketAssetDto) {
    - `bucket` 端点会根据此参数决定是否在响应中包含 `latitude` 和 `longitude` 数组
    - 代码证据：`asset.repository.ts:804` 和 `897` 仅在 `getTimeBucket` 中有条件 select 坐标
 
-2. **筛选类参数（同时生效）**：
+2. **`orderBy` 的双重作用**：
+   - **在 buckets 中**：决定分桶时使用的日期字段（`localDateTime` 或 `createdAt`）
+   - **在 bucket 中**：同时影响两个方面
+     - 月份匹配：与 `timeBucket` 进行比较的日期字段
+     - 桶内排序：资产排序的第一关键字段
+   - 代码证据：`asset.repository.ts:820` 用于月份匹配，`866-872` 用于桶内排序
+
+3. **`order` 的双重作用**：
+   - **在 buckets 中**：控制分桶列表的排序方向（最新在前或最旧在前）
+   - **在 bucket 中**：控制单桶内资产的排序方向
+   - 代码证据：`asset.repository.ts:759` 用于分桶排序，`870`、`872` 用于桶内排序
+
+4. **筛选类参数（同时生效）**：
    - 所有筛选参数对两个端点同样生效
    - 例如：`isFavorite=true` 会同时影响分桶列表（只计算收藏资产）和单桶详情（只返回收藏资产）
 
-3. **未使用参数**：
+5. **未使用参数**：
    - `key` 和 `slug` 在 DTO 中定义但后端代码未实际使用
 
 ### 2.5 单桶匹配一致性与异常输入容错
