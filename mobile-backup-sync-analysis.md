@@ -1,8 +1,14 @@
-# Immich 移动端备份状态同步完整分析
+# Immich 移动端备份状态同步完整分析（校正版）
 
 ## 1. 概述
 
-Immich 移动端备份系统采用了双层架构设计，支持前台（Foreground）和后台（Background）两种上传模式。系统通过 Riverpod 状态管理、SQLite 本地持久化（Drift）和与服务端的同步流（Sync Stream）实现完整的备份状态同步。
+Immich 移动端备份系统采用了"双层上传 + 三阶段确认"架构设计：
+- **双层上传**：前台（Foreground）HTTP 并发上传 + 后台（Background）iOS URLSession 保活上传
+- **三阶段确认**：HTTP 响应即时确认 → 内存计数乐观更新 → Sync Stream 最终落库确认
+
+系统通过 Riverpod 状态管理、SQLite 本地持久化（Drift）和 WebSocket 同步流实现完整的备份状态同步。
+
+---
 
 ## 2. 核心组件概览
 
@@ -10,7 +16,7 @@ Immich 移动端备份系统采用了双层架构设计，支持前台（Foregro
 
 | 组件 | 文件路径 | 核心职责 |
 |------|---------|---------|
-| `DriftBackupNotifier` | `mobile/lib/providers/backup/drift_backup.provider.dart` | 全局备份状态管理、进度追踪、错误处理 |
+| `DriftBackupNotifier` | `mobile/lib/providers/backup/drift_backup.provider.dart` | 全局备份状态管理、内存计数、进度追踪、错误处理 |
 | `AssetUploadProgressNotifier` | `mobile/lib/providers/backup/asset_upload_progress.provider.dart` | 单资产上传进度追踪 |
 | `BackupNotifier` | `mobile/lib/providers/backup/backup.provider.dart` | 服务端磁盘信息同步 |
 
@@ -18,17 +24,25 @@ Immich 移动端备份系统采用了双层架构设计，支持前台（Foregro
 
 | 组件 | 文件路径 | 核心职责 |
 |------|---------|---------|
-| `ForegroundUploadService` | `mobile/lib/services/foreground_upload.service.dart` | 前台 HTTP 同步上传，支持并发 Worker 池 |
+| `ForegroundUploadService` | `mobile/lib/services/foreground_upload.service.dart` | 前台 HTTP 同步上传，支持并发 Worker 池（默认3并发） |
 | `BackgroundUploadService` | `mobile/lib/services/background_upload.service.dart` | iOS 后台 URLSession 上传，支持应用挂起 |
-| `SyncStreamService` | `mobile/lib/domain/services/sync_stream.service.dart` | 服务端事件流同步，确认上传结果 |
+| `SyncStreamService` | `mobile/lib/domain/services/sync_stream.service.dart` | 服务端事件流同步，最终写入远程资产表 |
+| `BackgroundSyncManager` | `mobile/lib/domain/utils/background_sync.dart` | 同步任务调度、隔离执行、任务取消 |
 
 ### 2.3 仓库层
 
 | 组件 | 文件路径 | 核心职责 |
 |------|---------|---------|
 | `UploadRepository` | `mobile/lib/repositories/upload.repository.dart` | 实际 HTTP 上传执行、进度回调 |
-| `DriftBackupRepository` | `mobile/lib/infrastructure/repositories/backup.repository.dart` | 备份候选查询、本地状态持久化 |
-| `RemoteAssetRepository` | `mobile/lib/infrastructure/repositories/remote_asset.repository.dart` | 远程资产缓存管理 |
+| `DriftBackupRepository` | `mobile/lib/infrastructure/repositories/backup.repository.dart` | 备份候选查询、本地状态统计 |
+| `SyncStreamRepository` | `mobile/lib/infrastructure/repositories/sync_stream.repository.dart` | 同步流数据落库（remote_asset 表） |
+| `RemoteAssetRepository` | `mobile/lib/infrastructure/repositories/remote_asset.repository.dart` | 远程资产缓存查询 |
+
+### 2.4 网络层
+
+| 组件 | 文件路径 | 核心职责 |
+|------|---------|---------|
+| `WebsocketNotifier` | `mobile/lib/providers/websocket.provider.dart` | WebSocket 连接管理、事件批处理防抖 |
 
 ---
 
@@ -45,7 +59,7 @@ onProgress(bytes, totalBytes) 回调
     ↓
 _handleForegroundBackupProgress()  [drift_backup.provider.dart:300-334]
     ├─ 计算 progress = bytes / totalBytes
-    ├─ UploadSpeedManager 更新速度
+    ├─ UploadSpeedManager 更新速度（滑动窗口算法）
     └─ 更新 DriftBackupState.uploadItems
 ```
 
@@ -120,6 +134,9 @@ Future<void> _executeWithWorkerPool<T>({
   int currentIndex = 0;
   Future<void> worker() async {
     while (true) {
+      if (shouldAbortUpload || (cancelToken != null && cancelToken.isCompleted)) {
+        break;
+      }
       final index = currentIndex;
       if (index >= items.length) break;
       currentIndex++;
@@ -131,132 +148,179 @@ Future<void> _executeWithWorkerPool<T>({
 }
 ```
 
+**注意**：并发模式下，`shouldAbortUpload` 被设置后，已在处理的资产会继续完成，只有新的资产会被跳过。
+
 ---
 
-## 4. 服务端确认机制
+## 4. 服务端确认机制（三阶段确认）
 
-### 4.1 同步确认流程
-
-上传成功后，系统通过两个独立通道确认资产状态：
+### 4.1 阶段 1：HTTP 响应即时确认（乐观更新）
 
 ```
-通道 1：HTTP 响应即时确认
-  uploadFile() 成功 → 返回 remoteAssetId
+_uploadSingleAsset()
     ↓
-  _handleForegroundBackupSuccess()  [drift_backup.provider.dart:336-343]
-    ├─ 更新 backupCount + 1, remainderCount - 1
-    ├─ 延迟 1s 后移除上传项（UI 过渡）
-    └─ 本地数据库已通过 checksum 关联
+_uploadRepository.uploadFile() → 返回 remoteAssetId
+    ↓
+callbacks.onSuccess(localAssetId, remoteAssetId)
+    ↓
+_handleForegroundBackupSuccess()  [drift_backup.provider.dart:336-343]
+    ├─ ✅ 内存更新：backupCount + 1, remainderCount - 1
+    ├─ ✅ UI更新：延迟 1s 后移除上传项
+    └─ ❌ 数据库：remote_asset_entity 表仍无记录
+```
 
-通道 2：Sync Stream 最终确认
-  服务端 AssetUploadReady 事件
+**关键代码** (`drift_backup.provider.dart:336-343`):
+```dart
+void _handleForegroundBackupSuccess(String localAssetId, String remoteAssetId) {
+  // ⚠️ 注意：这里只更新内存状态，不写入数据库
+  state = state.copyWith(
+    backupCount: state.backupCount + 1,
+    remainderCount: state.remainderCount - 1,
+  );
+  _uploadSpeedManager.removeTask(localAssetId);
+  Future.delayed(const Duration(milliseconds: 1000), () {
+    _removeUploadItem(localAssetId);
+  });
+}
+```
+
+### 4.2 阶段 2：WebSocket 事件批处理（异步落库）
+
+服务端处理完上传资产后（转码、缩略图生成等），通过 WebSocket 推送 `AssetUploadReady` 事件。
+
+```
+服务端 AssetUploadReadyV1/V2 事件
     ↓
-  SyncStreamService.handleWsAssetUploadReadyV1Batch()  [sync_stream.service.dart:328-369]
+WebsocketNotifier._handleSyncAssetUploadReadyV1/V2()
+    ↓ 加入批处理队列
+_batchedAssetUploadReady.add(data)
+    ↓ 防抖触发（5s 间隔 / 10s 最大等待）
+_batchDebouncer.run(_processBatchedAssetUploadReadyV1/V2)
+    ↓
+BackgroundSyncManager.syncWebsocketBatchV1/V2()
+    ↓ 隔离执行
+runInIsolateGentle(_handleWsAssetUploadReadyV1Batch)
+    ↓
+SyncStreamService.handleWsAssetUploadReadyV1Batch()
     ├─ 解析 SyncAssetV1 + SyncAssetExifV1
-    ├─ 写入 remote_asset_entity 表
-    └─ 通过 checksum 关联本地资产
+    ├─ ✅ 写入 remote_asset_entity 表（checksum 关联）
+    └─ ✅ 写入 remote_exif_entity 表
 ```
 
-### 4.2 HTTP 响应确认
-
-`upload.repository.dart:91-150` 中 `uploadFile()` 方法：
+**批处理防抖配置** (`websocket.provider.dart:49-52`):
 ```dart
-Future<UploadResult> uploadFile({...}) async {
-  final response = await NetworkRepository.client.send(baseRequest);
-  final responseBodyString = await response.stream.bytesToString();
-
-  if ([200, 201].contains(response.statusCode)) {
-    final responseBody = jsonDecode(responseBodyString);
-    return UploadResult.success(remoteAssetId: responseBody['id'] as String);
-  }
-  // 错误处理...
-}
+final Debouncer _batchDebouncer = Debouncer(
+  interval: const Duration(seconds: 5),    // 最少 5s 间隔
+  maxWaitTime: const Duration(seconds: 10), // 最多等待 10s
+);
 ```
 
-**成功响应结构**:
-```json
-{
-  "id": "uuid-of-uploaded-asset",
-  // ... 其他资产元数据
-}
-```
-
-### 4.3 同步流最终确认
-
-Sync Stream 是服务端状态的真实来源（Source of Truth）。服务端处理完上传的资产后（包括转码、缩略图生成等），会通过 WebSocket 发送 `AssetUploadReady` 事件。
-
-**批处理确认** (`sync_stream.service.dart:328-412`):
+**落库实现** (`sync_stream.repository.dart:196-272`):
 ```dart
-Future<void> handleWsAssetUploadReadyV1Batch(List<dynamic> batchData) async {
-  final List<SyncAssetV1> assets = [];
-  final List<SyncAssetExifV1> exifs = [];
-
-  for (final data in batchData) {
-    final asset = SyncAssetV1.fromJson(data['asset']);
-    final exif = SyncAssetExifV1.fromJson(data['exif']);
-    assets.add(asset);
-    exifs.add(exif);
-  }
-
-  // 批量写入本地数据库
-  await _syncStreamRepository.updateAssetsV1(assets);
-  await _syncStreamRepository.updateAssetsExifV1(exifs);
+Future<void> updateAssetsV1(Iterable<SyncAssetV1> data, {String debugLabel = 'user'}) async {
+  await _db.batch((batch) {
+    for (final asset in data) {
+      final companion = RemoteAssetEntityCompanion(
+        checksum: Value(asset.checksum),  // ⚠️ 关键：通过 checksum 关联本地资产
+        ownerId: Value(asset.ownerId),
+        uploadedAt: Value(asset.createdAt),
+        // ... 其他字段
+      );
+      batch.insert(
+        _db.remoteAssetEntity,
+        companion.copyWith(id: Value(asset.id)),
+        onConflict: DoUpdate((_) => companion),  // 冲突则更新
+      );
+    }
+  });
 }
 ```
 
-### 4.4 本地-远程关联机制
+### 4.3 阶段 3：全量同步（最终一致性保障）
 
-**通过 Checksum 关联** (`backup.repository.dart:39-82`):
-```sql
-SELECT
-  COUNT(*) AS total_count,
-  COUNT(*) FILTER (WHERE rae.id IS NULL) AS remainder_count
-FROM local_asset_entity lae
-LEFT JOIN main.remote_asset_entity rae
-    ON lae.checksum = rae.checksum AND rae.owner_id = ?1
-WHERE EXISTS (
-    SELECT 1 FROM local_album_asset_entity laa
-    INNER JOIN main.local_album_entity la ON laa.album_id = la.id
-    WHERE laa.asset_id = lae.id AND la.backup_selection = ?2
-)
+应用启动或用户手动触发时执行全量同步，确保即使 WebSocket 事件丢失也能最终对齐。
+
+```
+BackgroundSyncManager.syncRemote()
+    ↓
+runInIsolateGentle(syncStreamService.sync())
+    ↓
+SyncStreamService.sync()
+    ├─ 版本检查 + 数据迁移
+    ├─ 调用 syncApiRepository.streamChanges()
+    ├─ 按批次处理所有同步事件
+    ├─ 每批处理完成后发送 ACK
+    └─ ✅ 全量写入 remote_asset_entity 表
 ```
 
-**关键关联点**:
-- `local_asset_entity.checksum` ↔ `remote_asset_entity.checksum`
-- 关联时同时匹配 `owner_id`（多用户支持）
-- 只有存在 `remote_asset` 记录的资产才被视为"已备份"
+### 4.4 状态差异时间窗口分析
+
+**时间窗口 1：HTTP 成功 → WebSocket 落库前**
+- 状态：`DriftBackupState.backupCount` 已更新，但 `remote_asset_entity` 无记录
+- 影响：
+  - ✅ UI 显示"已备份"计数正确
+  - ❌ 如果此时调用 `getBackupStatus()`，SQL 查询会显示不一致（因为 SQL 通过 checksum 关联判断）
+  - ✅ 下次备份时，`getCandidates()` 仍会排除该资产吗？**不会！**
+    - `getCandidates()` 通过 `NOT EXISTS (remote_asset where checksum = local.checksum)` 判断
+    - HTTP 成功后 checksum 未写入 remote_asset，所以该资产会被重新查询为候选
+    - **但实际上传时服务端会检测到重复并返回已存在的 assetId**
+
+**时间窗口 2：WebSocket 落库 → UI 刷新前**
+- 状态：`remote_asset_entity` 已更新，但 `DriftBackupState` 内存计数未变
+- 影响：
+  - ❌ UI 显示的 `backupCount` 可能与实际数据库不一致
+  - ✅ 下次调用 `getBackupStatus()` 时会重新计算并对齐
 
 ---
 
 ## 5. 失败恢复机制
 
-### 5.1 失败分类与处理
+### 5.1 失败分类与停止条件
 
-| 失败类型 | 触发条件 | 处理策略 |
-|---------|---------|---------|
-| **取消上传** | 用户主动取消 | `RequestAbortedException` → 标记 `isCancelled`，终止队列 |
-| **配额超限** | 服务端返回 413 或 "Quota has been exceeded" | 立即终止整个上传队列 |
-| **网络错误** | 连接超时、DNS 失败等 | 单资产失败，不影响其他资产，`isFailed: true` |
-| **文件不存在** | 本地资产已被删除 | 标记失败，跳过继续 |
-| **iCloud 下载失败** | iOS 云端资产无法加载 | 标记失败，跳过继续 |
+| 失败类型 | 触发条件 | 停止队列？ | 处理策略 |
+|---------|---------|-----------|---------|
+| **用户取消** | `cancelToken.complete()` | ✅ 立即 | 所有 worker 检测到后退出循环 |
+| **配额超限** | 服务端返回 "Quota has been exceeded!" | ✅ 立即 | 设置 `shouldAbortUpload = true`，剩余资产跳过 |
+| **文件过大 (413)** | 服务端返回 413 错误 | ❌ 不停止 | 标记单资产失败，继续下一个 |
+| **网络错误** | 连接超时、DNS 失败等 | ❌ 不停止 | 标记单资产失败，继续下一个 |
+| **文件不存在** | 本地资产已被删除 | ❌ 不停止 | 标记单资产失败，继续下一个 |
+| **iCloud 下载失败** | iOS 云端资产无法加载 | ❌ 不停止 | 标记单资产失败，继续下一个 |
 
-### 5.2 前台上传失败处理
-
-`foreground_upload.service.dart:407-419`:
+**关键代码** (`foreground_upload.service.dart:390-406`):
 ```dart
-} catch (error, stackTrace) {
-  _logger.severe("Error backup asset: ${error.toString()}", stackTrace);
-  callbacks.onError?.call(asset.localId!, error.toString());
-} finally {
-  // iOS 清理临时文件
-  if (Platform.isIOS) {
-    await file?.delete();
-    await livePhotoFile?.delete();
+if (result.isSuccess && result.remoteAssetId != null) {
+  callbacks.onSuccess?.call(asset.localId!, result.remoteAssetId!);
+} else if (result.isCancelled) {
+  _logger.warning(() => "Backup was cancelled by the user");
+  shouldAbortUpload = true;  // ✅ 停止队列
+} else if (result.errorMessage != null) {
+  callbacks.onError?.call(asset.localId!, result.errorMessage!);
+  
+  if (result.errorMessage == "Quota has been exceeded!") {
+    shouldAbortUpload = true;  // ✅ 只有配额超限才停止队列
+  }
+  // ❌ 413 文件过大等其他错误不停止队列
+}
+```
+
+**队列停止检测点** (`foreground_upload.service.dart:211-213`):
+```dart
+Future<void> worker() async {
+  while (true) {
+    // 每次循环开始检测是否应该停止
+    if (shouldAbortUpload || (cancelToken != null && cancelToken.isCompleted)) {
+      break;
+    }
+    // ... 处理下一个资产
   }
 }
 ```
 
-**状态更新** (`drift_backup.provider.dart:345-374`):
+> **重要校正**：之前的分析错误地认为文件过大 (413) 会停止队列，实际上只有"配额超限"会停止整个上传队列。文件过大、网络错误等都只影响单个资产。
+
+### 5.2 前台上传失败处理
+
+**失败回调** (`drift_backup.provider.dart:345-374`):
 ```dart
 void _handleForegroundBackupError(String localAssetId, String errorMessage) {
   final currentItem = state.uploadItems[localAssetId];
@@ -270,28 +334,51 @@ void _handleForegroundBackupError(String localAssetId, String errorMessage) {
 }
 ```
 
+**失败恢复边界**：
+- ✅ 失败记录保存在 `DriftBackupState.uploadItems` 内存中
+- ❌ 失败记录不持久化到数据库
+- ❌ 没有自动重试机制
+- ✅ 用户手动重新触发备份时，已成功的资产通过 checksum 去重不会重复上传
+- ✅ 失败的资产会被重新尝试上传
+
 ### 5.3 后台上传重试机制
 
-`background_upload.service.dart:424-441` 中任务配置：
+**任务配置** (`background_upload.service.dart:424-441`):
 ```dart
 return UploadTask(
-  retries: 3,           // 自动重试 3 次
+  retries: 3,           // ✅ background_downloader 自动重试 3 次
   updates: Updates.statusAndProgress,
   // ...
 );
 ```
 
-后台上传由系统 `background_downloader` 库管理：
-- 自动重试网络临时故障
-- 失败任务状态持久化到本地数据库
-- 应用重启后可查询失败任务重新入队
+**后台上传失败处理** (`background_upload.service.dart:211-230`):
+```dart
+void _handleTaskStatusUpdate(TaskStatusUpdate update) async {
+  switch (update.status) {
+    case TaskStatus.complete:
+      unawaited(_handleLivePhoto(update));  // 只处理 Live Photo 第二阶段
+      // ⚠️ 注意：普通资产上传成功后，这里不更新任何状态！
+      // 状态完全依赖 Sync Stream 最终确认
+      break;
+    // 其他状态（失败、重试等）没有特殊处理
+    default:
+      break;
+  }
+}
+```
 
-### 5.4 断点续传
+> **重要发现**：后台上传成功后，除了 Live Photo 需要触发第二阶段上传外，普通资产不会更新任何本地状态。所有状态更新完全依赖 WebSocket 事件或全量同步。
 
-**当前实现限制**:
-- ✅ 应用重启后可继续未完成的后台任务（iOS URLSession 支持）
-- ❌ 不支持文件级别的断点续传（每次重新上传整个文件）
-- ✅ 已上传成功的资产不会重复上传（通过 checksum 去重）
+### 5.4 断点续传能力
+
+| 能力 | 支持情况 | 说明 |
+|------|---------|------|
+| 应用重启后继续后台任务 | ✅ 支持 | iOS URLSession 系统级支持 |
+| 文件级断点续传 | ❌ 不支持 | 每次失败后重新上传整个文件 |
+| 资产级去重 | ✅ 支持 | 通过 checksum 避免重复上传 |
+| 失败持久化 | ❌ 不支持 | 失败记录仅在内存中 |
+| 失败自动重试 | ⚠️ 部分支持 | 后台上传自动重试3次，前台上传不自动重试 |
 
 **去重逻辑** (`backup.repository.dart:84-116`):
 ```dart
@@ -299,10 +386,8 @@ Future<List<LocalAsset>> getCandidates(String userId, {bool onlyHashed = true}) 
   final query = _db.localAssetEntity.select()
     ..where(
       (lae) =>
-        // 存在于选中的相册
-        existsQuery(...) &
-        // 在远程资产中不存在相同 checksum
-        notExistsQuery(
+        existsQuery(...) &  // 在选中相册中
+        notExistsQuery(     // 远程不存在相同 checksum
           _db.remoteAssetEntity.selectOnly()
             ..addColumns([_db.remoteAssetEntity.checksum])
             ..where(
@@ -310,7 +395,6 @@ Future<List<LocalAsset>> getCandidates(String userId, {bool onlyHashed = true}) 
               _db.remoteAssetEntity.ownerId.equals(userId),
             ),
         ) &
-        // 不在排除的相册中
         lae.id.isNotInQuery(_getExcludedSubquery()),
     );
   // ...
@@ -319,78 +403,68 @@ Future<List<LocalAsset>> getCandidates(String userId, {bool onlyHashed = true}) 
 
 ---
 
-## 6. 前后端状态对齐
+## 6. 前后端状态对齐机制
 
 ### 6.1 状态对齐架构
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                     移动端 (Client)                         │
-│  ┌──────────────┐     ┌──────────────┐     ┌──────────────┐ │
-│  │  本地资产表  │────▶│  备份状态表  │────▶│  远程资产表  │ │
-│  │ (local_asset)│     │ (Drift 内存) │     │ (remote_asset)│ │
-│  └──────────────┘     └──────────────┘     └───────┬──────┘ │
-│         ▲                                            │        │
-│         │ PhotoManager 扫描                   Sync Stream │
-│         │                                            ▼        │
-└─────────┴────────────────────────────────────────────────────┘
-          │                                            │
-          │                                            │
-┌─────────┴────────────────────────────────────────────┴────────┐
-│                     服务端 (Server)                           │
-│  ┌──────────────┐     ┌──────────────┐     ┌──────────────┐  │
-│  │  资产存储    │────▶│  元数据DB    │────▶│  同步流服务  │  │
-│  │ (文件系统)   │     │ (PostgreSQL) │     │ (WebSocket)  │  │
-│  └──────────────┘     └──────────────┘     └──────────────┘  │
-└─────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────────┐
+│                         移动端 (Client)                                  │
+│                                                                          │
+│  ┌────────────────────┐    ┌────────────────────┐    ┌────────────────┐ │
+│  │  local_asset_entity │───▶│ DriftBackupState   │───▶│ remote_asset_  │ │
+│  │  (本地资产清单)     │    │  (内存状态)        │    │ entity (远程   │ │
+│  │  - checksum         │    │  - backupCount     │    │  资产缓存)     │ │
+│  │  - createdAt        │    │  - remainderCount  │    │  - checksum    │ │
+│  │                     │    │  - uploadItems     │    │  - ownerId     │ │
+│  └─────────▲──────────┘    └──────────▲─────────┘    └────────┬───────┘ │
+│            │                        │                           │         │
+│            │ PhotoManager 扫描      │ HTTP 回调                │ Sync    │
+│            │                        │                           │ Stream  │
+│            │                        │                           ▼         │
+└────────────┼────────────────────────┼─────────────────────────────────────┘
+             │                        │                             │
+             │                        │                             │
+┌────────────┴────────────────────────┴─────────────────────────────┴───────┐
+│                         服务端 (Server)                                    │
+│                                                                           │
+│  ┌──────────────┐     ┌──────────────┐     ┌──────────────┐     ┌────────┐ │
+│  │  文件存储    │────▶│  PostgreSQL  │────▶│  Sync Stream │────▶│ WebSocket │
+│  │  (对象存储)  │     │  (元数据)    │     │  (事件流)    │     │  (推送)   │ │
+│  └──────────────┘     └──────────────┘     └──────────────┘     └────────┘ │
+└───────────────────────────────────────────────────────────────────────────┘
 ```
 
-### 6.2 状态同步触发点
+### 6.2 四重状态对齐机制
 
-| 触发时机 | 同步内容 | 执行方 |
-|---------|---------|-------|
-| 应用启动 | 全量同步远程资产 | SyncStreamService.sync() |
-| 备份页面打开 | 查询备份统计 | DriftBackupNotifier.getBackupStatus() |
-| 上传成功后 | 即时更新计数 | _handleForegroundBackupSuccess() |
-| WebSocket 推送 | 增量更新远程资产 | handleWsAssetUploadReadyV1Batch() |
-| 手动刷新 | 重新拉取备份统计 | 用户下拉刷新 |
+| 对齐机制 | 触发时机 | 覆盖范围 | 延迟 |
+|---------|---------|---------|------|
+| **HTTP 回调乐观更新** | 每个资产上传成功 | 内存计数 | 即时 |
+| **WebSocket 批处理** | 服务端处理完成后推送 | 远程资产表 | 5-10s（防抖） |
+| **全量同步** | 应用启动 / 手动触发 | 全量远程数据 | 分钟级 |
+| **备份统计查询** | 备份页面打开 / 刷新 | 重新计算所有计数 | 即时 |
 
 ### 6.3 本地数据库表结构
 
-**local_asset_entity** - 本地资产清单
+**local_asset_entity** - 本地资产清单（无备份状态字段）
 - `id`: 本地资产唯一标识
 - `checksum`: 文件哈希（用于关联远程资产）
 - `cloudId`: iOS 云端标识（iCloud）
 - `createdAt`, `updatedAt`: 文件时间戳
+- **注意**：没有 `isBackedUp` 或类似字段，备份状态完全通过关联查询判断
 
-**remote_asset_entity** - 远程资产缓存（同步流写入）
+**remote_asset_entity** - 远程资产缓存（Sync Stream 写入）
 - `id`: 服务端资产 UUID
 - `checksum`: 文件哈希（关联本地资产的关键）
 - `ownerId`: 所属用户 ID
+- `uploadedAt`: 上传时间
 - `deletedAt`: 删除标记（软删除）
 - `stackId`: 相册堆 ID
 
 **local_album_entity** - 相册配置
 - `backupSelection`: `selected` / `excluded` / `none`
 
-### 6.4 一致性保障机制
-
-1. **Checksum 作为事实关联键**
-   - 上传前计算本地文件 checksum
-   - 服务端返回的资产也包含 checksum
-   - 同步时通过 checksum 匹配，避免重复上传
-
-2. **Sync Stream 最终一致性**
-   - 所有服务端变更通过同步流推送
-   - 客户端按顺序处理事件，发送 ACK 确认
-   - 支持 `syncResetV1` 事件重置客户端状态
-
-3. **定期全量同步**
-   - 每次应用启动执行完整同步
-   - 处理同步流可能遗漏的变更
-   - 执行数据迁移任务
-
-### 6.5 状态查询 API
+### 6.4 状态查询 API
 
 `backup.repository.dart:39-82` 单 SQL 查询获取所有统计：
 ```sql
@@ -415,9 +489,33 @@ AND NOT EXISTS (
 
 **状态字段说明**:
 - `totalCount`: 选中相册中的资产总数
-- `backupCount`: `totalCount - remainderCount`（已备份）
+- `backupCount`: `totalCount - remainderCount`（内存中维护，非数据库查询）
 - `remainderCount`: 远程不存在的资产数（待上传）
 - `processingCount`: checksum 为 NULL 的资产数（正在计算哈希）
+
+> **关键发现**：`DriftBackupState.backupCount` 是内存维护的增量计数器，而 `getBackupStatus()` 返回的是数据库查询结果。两者可能在 HTTP 成功后、WebSocket 落库前出现短暂不一致。
+
+### 6.5 一致性保障机制
+
+1. **Checksum 作为事实关联键**
+   - 上传前计算本地文件 checksum
+   - 服务端返回的资产也包含 checksum
+   - 同步时通过 checksum 匹配，避免重复上传
+
+2. **Sync Stream 最终一致性**
+   - 所有服务端变更通过同步流推送
+   - 客户端按顺序处理事件，发送 ACK 确认
+   - 支持 `syncResetV1` 事件重置客户端状态
+
+3. **定期全量同步**
+   - 每次应用启动执行完整同步
+   - 处理同步流可能遗漏的变更
+   - 执行数据迁移任务
+
+4. **备份页面重新查询**
+   - 每次打开备份页面调用 `getBackupStatus()`
+   - 从数据库重新计算所有统计
+   - 修正内存计数可能的偏差
 
 ---
 
@@ -428,19 +526,19 @@ AND NOT EXISTS (
 iOS Live Photo 包含照片 + 视频两个文件，需分开上传：
 
 ```
-阶段 1：上传视频部分
+阶段 1：上传视频部分（普通优先级）
   getUploadTask(asset) → 提取 motion file
     ↓
-  上传成功 → 返回 remoteAssetId
+  后台上传成功 → 返回 remoteAssetId
     ↓
   _handleLivePhoto() → 构建第二阶段任务
 
-阶段 2：上传照片部分
+阶段 2：上传照片部分（高优先级）
   getLivePhotoUploadTask(asset, livePhotoVideoId)
     ↓
   fields['livePhotoVideoId'] = videoId
     ↓
-  上传照片，关联视频 ID
+  上传照片，关联视频 ID（priority=0, 最高优先级）
 ```
 
 ### 7.2 任务分组与优先级
@@ -451,6 +549,19 @@ iOS Live Photo 包含照片 + 视频两个文件，需分开上传：
 /// 1. 视频文件：普通优先级组 (kBackupGroup)
 /// 2. 照片文件：高优先级组 (kBackupLivePhotoGroup, priority=0)
 /// 取消操作只取消视频组，照片组不受影响（视频已上传）
+```
+
+**不同组的取消行为** (`background_upload.service.dart:195-204`):
+```dart
+Future<int> cancel() async {
+  shouldAbortQueuingTasks = true;
+  await _storageRepository.clearCache();
+  await _uploadRepository.reset(kBackupGroup);           // 只重置普通备份组
+  await _uploadRepository.deleteDatabaseRecords(kBackupGroup);  // 只清理普通备份组
+  // ⚠️ Live Photo 照片组 (kBackupLivePhotoGroup) 不会被取消
+  final activeTasks = await _uploadRepository.getActiveTasks(kBackupGroup);
+  return activeTasks.length;
+}
 ```
 
 ---
@@ -512,10 +623,10 @@ void stopForegroundBackup() {
 }
 ```
 
-**取消传播**:
+**取消传播链**:
 1. `Completer.complete()` 触发 future 完成
 2. `ProgressMultipartRequest` 监听 `abortTrigger` future
-3. 抛出 `RequestAbortedException` 终止上传
+3. 抛出 `RequestAbortedException` 终止当前上传
 4. Worker 池检测到 `cancelToken.isCompleted` 退出循环
 
 ### 9.2 后台上传取消
@@ -532,26 +643,165 @@ Future<int> cancel() async {
 }
 ```
 
+> **注意**：后台上传取消只影响 `kBackupGroup` 组，`kBackupLivePhotoGroup`（Live Photo 照片）不会被取消。
+
 ---
 
-## 10. 总结
+## 10. 各组件衔接关系全景
 
-### 10.1 设计亮点
+### 10.1 完整数据流图
+
+```
+用户触发备份
+    │
+    ▼
+┌──────────────────────────────────────────────────────────────────┐
+│ DriftBackupNotifier.startForegroundBackup()                     │
+│  ├─ 创建 cancelToken                                            │
+│  └─ 调用 ForegroundUploadService.uploadCandidates()              │
+└───────────────────────────────────┬──────────────────────────────┘
+                                    │
+    ┌───────────────────────────────┘
+    │
+    ▼
+┌──────────────────────────────────────────────────────────────────┐
+│ ForegroundUploadService._executeWithWorkerPool()                 │
+│  ├─ 3 个并发 Worker                                              │
+│  └─ 每个 Worker 调用 _uploadSingleAsset()                        │
+└───────────────────────────────────┬──────────────────────────────┘
+                                    │
+    ┌───────────────────────────────┘
+    │
+    ▼
+┌──────────────────────────────────────────────────────────────────┐
+│ ForegroundUploadService._uploadSingleAsset()                     │
+│  ├─ 检查本地文件 / iCloud 下载                                    │
+│  ├─ 调用 UploadRepository.uploadFile()                           │
+│  ├─ 成功 → callbacks.onSuccess()                                 │
+│  ├─ 失败 → callbacks.onError()                                   │
+│  └─ 配额超限 → 设置 shouldAbortUpload = true                     │
+└───────────────────────────────────┬──────────────────────────────┘
+                                    │
+          ┌─────────────────────────┴─────────────────────────┐
+          │                                                   │
+          ▼                                                   ▼
+┌──────────────────────────────┐                   ┌──────────────────────────────┐
+│ _handleForegroundBackupSuccess │                   │ _handleForegroundBackupError  │
+│  ├─ backupCount + 1            │                   │  ├─ 标记 isFailed = true      │
+│  ├─ remainderCount - 1         │                   │  └─ 保存 errorMessage        │
+│  └─ 延迟 1s 移除上传项          │                   └──────────────────────────────┘
+└───────────────┬────────────────┘
+                │
+                ▼  [ 时间窗口：HTTP 成功，WebSocket 未落库 ]
+                │
+                ▼
+┌──────────────────────────────────────────────────────────────────┐
+│ 服务端处理资产（转码、缩略图、元数据提取）                        │
+└───────────────────────────────────┬──────────────────────────────┘
+                                    │
+                                    ▼
+┌──────────────────────────────────────────────────────────────────┐
+│ WebSocket 推送 AssetUploadReadyV1/V2 事件                        │
+└───────────────────────────────────┬──────────────────────────────┘
+                                    │
+    ┌───────────────────────────────┘
+    │
+    ▼
+┌──────────────────────────────────────────────────────────────────┐
+│ WebsocketNotifier._handleSyncAssetUploadReadyV1/V2()             │
+│  ├─ 加入 _batchedAssetUploadReady 队列                           │
+│  └─ Debouncer 防抖（5s / 10s）                                   │
+└───────────────────────────────────┬──────────────────────────────┘
+                                    │
+    ┌───────────────────────────────┘
+    │
+    ▼
+┌──────────────────────────────────────────────────────────────────┐
+│ BackgroundSyncManager.syncWebsocketBatchV1/V2()                  │
+│  └─ runInIsolateGentle() 隔离执行                                │
+└───────────────────────────────────┬──────────────────────────────┘
+                                    │
+    ┌───────────────────────────────┘
+    │
+    ▼
+┌──────────────────────────────────────────────────────────────────┐
+│ SyncStreamService.handleWsAssetUploadReadyV1Batch()              │
+│  ├─ 解析 SyncAssetV1 + SyncAssetExifV1                           │
+│  └─ 调用 SyncStreamRepository.updateAssetsV1()                    │
+└───────────────────────────────────┬──────────────────────────────┘
+                                    │
+    ┌───────────────────────────────┘
+    │
+    ▼
+┌──────────────────────────────────────────────────────────────────┐
+│ SyncStreamRepository.updateAssetsV1()                            │
+│  ├─ batch insert 到 remote_asset_entity                          │
+│  └─ onConflict: DoUpdate（冲突则更新）                            │
+└──────────────────────────────────────────────────────────────────┘
+                                    │
+                                    ▼  [ 状态最终一致 ]
+```
+
+### 10.2 失败恢复边界
+
+```
+前台上传失败
+    │
+    ├─ isFailed: true（内存状态）
+    ├─ 不写入数据库
+    ├─ 不自动重试
+    └─ 用户重新备份 → 重新查询候选 → 已成功的 checksum 去重 → 失败的重新上传
+
+后台上传失败
+    │
+    ├─ background_downloader 自动重试 3 次
+    ├─ 失败后任务状态持久化到系统数据库
+    ├─ 应用重启后可查询 pending tasks
+    └─ 调用 resume() 继续
+
+WebSocket 事件丢失
+    │
+    ├─ 下次全量同步时补全
+    └─ 备份页面刷新时重新统计
+
+应用冷启动
+    │
+    ├─ 执行全量同步 syncRemote()
+    ├─ 同步所有远程资产到 remote_asset_entity
+    └─ 状态完全对齐
+```
+
+---
+
+## 11. 总结
+
+### 11.1 设计亮点
 
 1. **双层上传架构**：前台并发 + 后台保活，兼顾速度和可靠性
 2. **Checksum 关联机制**：无需保存上传记录，通过文件哈希自然去重
-3. **Sync Stream 最终一致性**：WebSocket 推送确保状态最终对齐
+3. **三阶段确认**：HTTP 即时反馈 + WebSocket 批处理 + 全量同步兜底
 4. **滑动窗口速度计算**：平滑的上传速度和剩余时间估算
 5. **Live Photo 优雅处理**：两阶段上传，高优先级确保完整性
+6. **任务隔离执行**：使用 Isolate 避免阻塞 UI 线程
 
-### 10.2 可改进点
+### 11.2 可改进点
 
 1. **缺乏真正的断点续传**：大文件上传失败需重新开始
-2. **失败资产无自动重试队列**：需用户手动重新触发备份
-3. **上传进度无持久化**：应用重启后进度重置
+2. **失败资产无持久化队列**：应用重启后丢失失败记录
+3. **内存计数与数据库查询不一致**：HTTP 成功后到 WebSocket 落库前存在时间窗口
 4. **并发数固定**：未根据网络条件动态调整并发数
+5. **前台上传无自动重试**：网络临时故障导致的失败需用户手动重试
 
-### 10.3 关键文件速查
+### 11.3 关键校正点
+
+| 校正项 | 之前结论 | 校正后结论 |
+|--------|---------|-----------|
+| 文件过大 (413) 是否停止队列 | 是 | ❌ 否，只有配额超限才停止队列 |
+| HTTP 成功后是否写入数据库 | 是 | ❌ 否，只更新内存计数，数据库写入依赖 Sync Stream |
+| 后台上传成功后是否更新状态 | 是 | ❌ 否，除 Live Photo 外，普通资产不更新任何状态 |
+| backupCount 来源 | 数据库查询 | ❌ 内存增量计数器，非数据库查询结果 |
+
+### 11.4 关键文件速查
 
 | 功能 | 文件 | 行号范围 |
 |------|------|---------|
@@ -562,3 +812,6 @@ Future<int> cancel() async {
 | 速度计算 | `upload_speed_calculator.dart` | 1-182 |
 | 同步流服务 | `sync_stream.service.dart` | 30-543 |
 | 备份统计查询 | `backup.repository.dart` | 39-116 |
+| WebSocket 批处理 | `websocket.provider.dart` | 43-231 |
+| 后台同步管理 | `background_sync.dart` | 1-278 |
+| 同步流落库 | `sync_stream.repository.dart` | 196-272 |
