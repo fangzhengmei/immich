@@ -219,30 +219,44 @@ getByOAuthId(sub_x) → 找到用户 B
 ### 3.5 LDAP 经 IdP 接入归一化冲突对照表
 
 下表按实际执行顺序，完整列出 LDAP 经 IdP 接入时可能出现的所有归一化冲突场景。异常类型说明：
-- **BadRequestException**：NestJS 内置异常，返回 `400 Bad Request`
-- **普通 Error**：被全局异常过滤器捕获，返回 `500 Internal Server Error`
+- **BadRequestException**：NestJS 内置异常，返回 `400 Bad Request`，客户端可看到具体错误消息
+- **普通 Error**：被全局异常过滤器捕获，统一返回 `500 Internal Server Error`，客户端仅看到通用错误
 
 | 序号 | Claim 来源 | Immich 落库字段 | 触发条件 | 代码处理路径 | 代码抛错类型 | 服务端日志文案 | 客户端 HTTP 响应 |
 |------|-----------|----------------|----------|--------------|--------------|----------------|------------------|
-| 1 | `sub` (LDAP entryUUID) | `oauthId` | `getByOAuthId(sub)` 找到用户 | `auth.service.ts:318` 直接使用该用户 | 无异常 | （无） | `200 OK`，登录成功，返回 accessToken |
-| 2 | `sub` (LDAP entryUUID) | `oauthId` | `getByOAuthId(sub)` 未命中，但 `getByEmail(email)` 找到用户且 `oauthId` 为空 | `auth.service.ts:320-330` 自动关联分支 | 无异常 | （无，静默更新） | `200 OK`，登录成功，用户 `oauthId` 被静默更新 |
-| 3 | **`sub` 变化** (LDAP 条目重建) | `oauthId` | `getByOAuthId(new_sub)` 未命中，`getByEmail(email)` 找到用户但 `oauthId ≠ new_sub` | `auth.service.ts:324-327` 冲突拒绝分支 | `BadRequestException` | `OAuth login conflict: email already linked to different account` | `400 Bad Request`，消息：`OAuth authentication failed` |
+| 1 | `sub` (LDAP entryUUID) | `oauthId` | `getByOAuthId(sub)` 找到用户 | `auth.service.ts:318` 直接使用该用户 | 无异常 | （无） | `200 OK`，登录成功 |
+| 2 | `sub` (LDAP entryUUID) | `oauthId` | `getByOAuthId(sub)` 未命中，但 `getByEmail(email)` 找到用户且 `oauthId` 为空 | `auth.service.ts:320-330` 自动关联分支 | 无异常 | （无，静默更新） | `200 OK`，登录成功 |
+| 3 | **`sub` 变化** (LDAP 条目重建) | `oauthId` | `getByOAuthId(new_sub)` 未命中，`getByEmail(email)` 找到用户但 `oauthId ≠ new_sub` | `auth.service.ts:324-327` 冲突拒绝分支 | `BadRequestException` | `OAuth login conflict: email already linked to different account` | `400 Bad Request`，`message: "OAuth authentication failed"` |
 | 4 | **`sub` 变化** (LDAP 条目重建) | `oauthId` | `getByOAuthId(new_sub)` 未命中，`getByEmail(email)` 未命中，`autoRegister=true` | `auth.service.ts:332-375` 自动注册分支 | 无异常（成功路径） | `Registering new user: {sub}/{email}` | `200 OK`，创建新用户成功 |
-| 5 | **`sub` 变化** (LDAP 条目重建) | `oauthId` | `getByOAuthId(new_sub)` 未命中，`getByEmail(email)` 未命中，`autoRegister=false` | `auth.service.ts:333-339` 拒绝分支 | `BadRequestException` | `Unable to register {sub}/{email}. User does not exist and auto registering is disabled.` | `400 Bad Request`，消息：`OAuth authentication failed` |
-| 6 | `email` (LDAP mail) | `email` | OAuth profile 无 `email` 字段或为空 | `auth.service.ts:341-343` 直接拒绝 | `BadRequestException` | （无，直接抛错） | `400 Bad Request`，消息：`OAuth profile does not have an email address` |
-| 7 | `email` (LDAP mail) | `email` | `getByOAuthId(sub)` 未命中，`getByEmail(email)` 找到用户但该用户的 `oauthId` 是**其他用户的 sub** | `auth.service.ts:324-327` 冲突拒绝分支 | `BadRequestException` | `OAuth login conflict: email already linked to different account` | `400 Bad Request`，消息：`OAuth authentication failed` |
-| 8 | `email` (LDAP mail) | `email` | 自动注册时 `createUser()` 发现邮箱已存在 | `base.service.ts:219-223` 邮箱唯一性检查 | `BadRequestException` | `User creation rejected: user already exists` | `400 Bad Request`，消息：`Email is not available` |
-| 9 | `sub` (手动 link 流程) | `oauthId` | `POST /oauth/link` 时 `getByOAuthId(sub)` 找到其他用户 | `auth.service.ts:424-427` 重复绑定检查 | `BadRequestException` | `OAuth link account failed: sub is already linked to another user ({email}).` | `400 Bad Request`，消息：`This OAuth account has already been linked to another user.` |
+| 5 | **`sub` 变化** (LDAP 条目重建) | `oauthId` | `getByOAuthId(new_sub)` 未命中，`getByEmail(email)` 未命中，`autoRegister=false` | `auth.service.ts:333-339` 拒绝分支 | `BadRequestException` | `Unable to register {sub}/{email}. User does not exist and auto registering is disabled.` | `400 Bad Request`，`message: "OAuth authentication failed"` |
+| 6 | `email` (LDAP mail) | `email` | OAuth profile 无 `email` 字段或为空 | `auth.service.ts:341-343` 直接拒绝 | `BadRequestException` | （无，直接抛错） | `400 Bad Request`，`message: "OAuth profile does not have an email address"` |
+| 7 | `email` (LDAP mail) | `email` | `getByOAuthId(sub)` 未命中，`getByEmail(email)` 找到用户但该用户的 `oauthId` 是**其他用户的 sub** | `auth.service.ts:324-327` 冲突拒绝分支 | `BadRequestException` | `OAuth login conflict: email already linked to different account` | `400 Bad Request`，`message: "OAuth authentication failed"` |
+| 8 | `email` (LDAP mail) | `email` | 自动注册时 `createUser()` 发现邮箱已存在 | `base.service.ts:219-223` 邮箱唯一性检查 | `BadRequestException` | `User creation rejected: user already exists` | `400 Bad Request`，`message: "Email is not available"` |
+| 9 | `sub` (手动 link 流程) | `oauthId` | `POST /oauth/link` 时 `getByOAuthId(sub)` 找到其他用户 | `auth.service.ts:424-427` 重复绑定检查 | `BadRequestException` | `OAuth link account failed: sub is already linked to another user ({email}).` | `400 Bad Request`，`message: "This OAuth account has already been linked to another user."` |
 | 10 | `sub` (手动 link 流程) | `oauthId` | `POST /oauth/link` 时 `getByOAuthId(sub)` 找到当前用户自己 | `auth.service.ts:424-427` 检查通过 | 无异常 | （无） | `200 OK`，关联成功 |
-| 11 | `immich_role` (LDAP 自定义属性) | `isAdmin` | 系统无管理员，新用户 `roleClaim` 不为 `admin` | `base.service.ts:225-230` 管理员检查 | `BadRequestException` | （无，直接抛错） | `400 Bad Request`，消息：`The first registered account must the administrator.` |
-| 12 | `preferred_username` (LDAP uid) | `storageLabel` | 自动注册时 `storageLabel` 与已有用户重复 | 数据库层唯一约束违反 | 普通 `Error`（来自数据库驱动） | （数据库错误日志） | `500 Internal Server Error`，消息：`duplicate key value violates unique constraint "user_storageLabel_key"` |
-| 13 | - | - | **Token 交换失败**（code 无效/过期、PKCE 不匹配、签名算法错误等） | `oauth.repository.ts:81-130` token 交换流程 | 普通 `Error`（非 BadRequestException） | `OAuth login failed: {具体错误原因}` | `500 Internal Server Error`，消息：`OAuth login failed` |
+| 11 | `immich_role` (LDAP 自定义属性) | `isAdmin` | 系统无管理员，新用户 `roleClaim` 不为 `admin` | `base.service.ts:225-230` 管理员检查 | `BadRequestException` | （无，直接抛错） | `400 Bad Request`，`message: "The first registered account must the administrator."` |
+| 12 | `preferred_username` (LDAP uid) | `storageLabel` | 自动注册时 `storageLabel` 与已有用户重复 | 数据库层唯一约束违反 | 普通 `Error` | `duplicate key value violates unique constraint "user_storageLabel_key"` | `500 Internal Server Error` |
+| 13 | - | - | **Token 交换失败**（code 无效/过期、PKCE 不匹配、签名算法错误等） | `oauth.repository.ts:81-130` token 交换流程 | 普通 `Error` | `OAuth login failed: {具体错误原因}` | `500 Internal Server Error` |
 
 > **关于场景 8 的说明**：在 OAuth 回调主路径中，`createUser()` 之前已通过 `getByEmail()` 检查过邮箱不存在，因此"邮箱已存在"主要属于**并发竞争场景**（两个相同邮箱的用户几乎同时发起首次登录），而非常规必经分支。
 
-> **关于场景 13 的说明**：`oauth.repository.ts:128` 抛出的是普通 `Error` 而非 `BadRequestException`，因此会被全局异常过滤器转换为 `500 Internal Server Error`，而非 `400 Bad Request`。
+> **关于场景 12、13 的说明**：普通 `Error` 分支在客户端统一返回 `500 Internal Server Error`，具体错误原因仅在服务端日志中可见，需排查时查看服务端日志定位真实原因。
 
-> **关于场景 12 的说明**：`storageLabel` 唯一约束在应用层未做前置检查，直接由数据库抛出异常，属于未被优雅处理的边界情况。
+---
+
+### 3.5.1 排障指引结论
+
+**排障时的判断顺序**：
+1. **先看客户端状态码**：
+   - `400 Bad Request` → 业务逻辑问题（参数错误、权限不足、冲突拒绝等），错误消息可直接定位原因
+   - `500 Internal Server Error` → 服务端/IdP 问题（token 交换失败、数据库异常、网络问题等），需查看服务端日志
+2. **再看服务端日志**：
+   - 搜索 `OAuth login failed` → 定位 token 交换失败的具体原因（code 过期、PKCE 不匹配、签名算法错误等）
+   - 搜索 `email already linked` → 定位账号绑定冲突
+   - 搜索 `duplicate key` → 定位数据库唯一约束违反
+   - 搜索 `auto registering is disabled` → 定位自动注册未开启问题
+
+**设计意图**：通过"状态码粗分问题类型，具体原因藏于日志，既保证客户端安全（不暴露内部错误详情），又方便运维排障（日志保留完整上下文）。
 
 ---
 
@@ -294,44 +308,54 @@ LDAP 经 IdP 接入时，OAuth 登录回调的实际执行顺序与冲突分流�
 **执行顺序详解**：
 
 1. **第一步：参数校验**（`auth.service.ts:298-306`）
-   - 校验 OAuth state 是否存在
-   - 校验 PKCE code_verifier 是否存在
-   - 任一缺失直接返回 400
+   - 校验 OAuth state 是否存在（从 cookie 或 dto 读取）
+   - 校验 PKCE code_verifier 是否存在（从 cookie 或 dto 读取）
+   - 任一缺失抛出 `BadRequestException` → `400 Bad Request`
 
-2. **第二步：获取用户 Profile**（`auth.service.ts:308-314`）
-   - 调用 `oauthRepository.getProfileAndOAuthSid()` 换取 token
-   - 从 ID token 或 UserInfo 端点获取 profile
+2. **第二步：Token 交换与 Profile 获取**（`auth.service.ts:308-314`）
+   - 调用 `oauthRepository.getProfileAndOAuthSid()` 执行 Authorization Code Flow
+   - 内部使用 `authorizationCodeGrant()` 换取 access token 和 ID token
+   - 从 ID token claims 或 UserInfo 端点获取用户 profile
    - `profile.sub` 必须存在，否则抛出异常
+   - **【场景 13】Token 交换失败**：code 无效/过期、PKCE 不匹配、签名算法错误等
+     - `oauth.repository.ts:128` 抛出普通 `Error`
+     - 被全局异常过滤器捕获 → `500 Internal Server Error`
+     - 服务端日志：`OAuth login failed: {具体原因}`
 
-3. **第三步：邮箱规范化与校验**（`auth.service.ts:315`）
+3. **第三步：邮箱规范化**（`auth.service.ts:315`）
    - `normalizedEmail = profile.email?.trim().toLowerCase()`
-   - 后续自动关联和自动注册都依赖此值
-   - 若 email 为空，到自动注册阶段会触发【场景 6】
+   - 后续自动关联和自动注册都依赖此规范化后的值
 
 4. **第四步：按优先级查找用户**
-   - **优先查 oauthId**：`getByOAuthId(profile.sub)` → 命中即【场景 1】登录成功
+   - **优先查 oauthId**：`getByOAuthId(profile.sub)`
+     - 命中 → 【场景 1】直接使用该用户，登录成功
    - **其次查 email**：oauthId 未命中时，`getByEmail(normalizedEmail)`
-     - 找到用户且 `oauthId` 为空 → 【场景 2】自动关联
-     - 找到用户但 `oauthId` 非空（且不等于当前 sub）→ 【场景 3/7】冲突拒绝
+     - 找到用户且 `oauthId` 为空 → 【场景 2】自动关联（更新 oauthId 后登录）
+     - 找到用户但 `oauthId` 非空且 ≠ 当前 sub → 【场景 3/7】冲突拒绝
      - 未找到用户 → 进入自动注册判断
 
 5. **第五步：自动注册判断**
-   - `autoRegister=false` → 【场景 5】拒绝登录
-   - `autoRegister=true` 且 email 为空 → 【场景 6】拒绝
-   - `autoRegister=true` 且 email 有效 → 调用 `createUser()`
-     - 邮箱唯一检查不通过 → 【场景 8】邮箱冲突
-     - 首个用户非 admin → 【场景 11】拒绝
-     - storageLabel 重复 → 【场景 12】数据库异常
-     - 全部通过 → 创建用户成功
+   - `autoRegister=false` → 【场景 5】`BadRequestException`，登录失败
+   - `autoRegister=true` 且 `normalizedEmail` 为空 → 【场景 6】`BadRequestException`
+   - `autoRegister=true` 且 email 有效 → 调用 `createUser()` 尝试创建
+     - 邮箱唯一检查不通过 → 【场景 8】`BadRequestException`（*并发竞争场景*）
+     - 系统无管理员且新用户非 admin → 【场景 11】`BadRequestException`
+     - storageLabel 数据库唯一约束违反 → 【场景 12】普通 `Error` → `500`
+     - 全部检查通过 → 【场景 4】创建用户成功
 
 6. **手动 Link 流程独立路径**（`auth.service.ts:407-435`）
    - 用户已通过密码登录（携带有效 session）
-   - 完成 OAuth 授权获取 sub
-   - `getByOAuthId(sub)` 检查是否已绑定
-     - 绑定到其他用户 → 【场景 9】拒绝
+   - 完成 OAuth 授权流程获取 oauthId
+   - `getByOAuthId(oauthId)` 检查是否已绑定
+     - 绑定到其他用户 → 【场景 9】`BadRequestException`
      - 绑定到自己或未绑定 → 【场景 10】关联成功
 
 **设计意图**：通过"oauthId 优先、email 兜底、自动注册为最后手段"的三级查找策略，在保证安全性（防止账号劫持）的前提下，最大程度实现登录方式的平滑迁移。
+
+**异常处理策略总结**：
+- **可预期的业务错误**（如用户不存在、权限不足、参数缺失）→ 使用 `BadRequestException` 返回 `400`
+- **不可预期的外部错误**（如 IdP 连接失败、token 验证失败、数据库约束违反）→ 抛出普通 `Error` 返回 `500`
+- 这种区分有助于客户端判断是用户操作问题还是服务端/IdP 配置问题
 
 ---
 
