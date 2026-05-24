@@ -507,25 +507,85 @@ streamForThumbnailJob(options: { force: boolean | undefined; ... }) {
 | **Ocr** | `ocrAt IS NULL` |
 | **Sidecar** | 无 `Sidecar` 类型的 asset_file |
 
-**force=true 时**：所有上述 `$if(!force, ...)` 条件被跳过，查询范围扩大到**所有未删除、非隐藏的资产**。
+**force=true 时**：上述 `$if(!force, ...)` 条件被跳过，但**不同队列的基础筛选条件不同**，并非都是"未删除且非隐藏"。详细差异见下文对照表。
+
+---
+
+##### 各队列 `force` 参数三态对照表
+
+> ⚠️ **关键发现**：
+> 1. **并非所有队列在 force=true 时都排除隐藏资产**
+> 2. **`!force` vs `force === false`** 的判断逻辑差异导致 `undefined` 和 `false` 的行为可能不同
+> 3. **参数类型差异**：`streamForThumbnailJob` 是 `boolean | undefined`（必填但可传 undefined），其他是 `force?: boolean`（可选参数）
+
+| 队列方法 | 条件判断逻辑 | `force` 未传递 (undefined) | `force = false` | `force = true` |
+|---------|-------------|---------------------------|-----------------|----------------|
+| **`streamForThumbnailJob`**<br>`$if(!options.force, ...)`<br>参数：`boolean \| undefined` | `!force` (falsy 判断) | ✅ 应用增量过滤<br>同 false | ✅ 应用增量过滤<br><br>**通用条件**：<br>- `deletedAt IS NULL`<br>- `visibility != Hidden`<br><br>**增量条件**：<br>- INNER JOIN `asset_job_status`<br>- 缺少 Thumbnail **OR**<br>- 缺少 Preview **OR**<br>- `thumbhash IS NULL` **OR**<br>- (已编辑 AND 缺少已编辑的 FullSize) **OR**<br>- (fullsizeEnabled AND 缺少 FullSize AND web不支持格式) | ❌ 跳过增量过滤<br><br>**仅保留通用条件**：<br>- `deletedAt IS NULL`<br>- `visibility != Hidden` |
+| **`streamForSearchDuplicates`**<br>`$if(!force, ...)`<br>参数：`force?: boolean` | `!force` (falsy 判断) | ✅ 应用增量过滤<br>同 false | ✅ 应用增量过滤<br><br>**通用条件**：<br>- `deletedAt IS NULL`<br>- INNER JOIN `smart_search` (必须有 embedding)<br>- `withDefaultVisibility` (非 Hidden/Locked)<br><br>**增量条件**：<br>- INNER JOIN `asset_job_status`<br>- `duplicatesDetectedAt IS NULL` | ❌ 跳过增量过滤<br><br>**仅保留通用条件**：<br>- `deletedAt IS NULL`<br>- INNER JOIN `smart_search`<br>- `withDefaultVisibility` |
+| **`streamForEncodeClip`**<br>`$if(!force, ...)`<br>参数：`force?: boolean` | `!force` (falsy 判断) | ✅ 应用增量过滤<br>同 false | ✅ 应用增量过滤<br><br>**通用条件**（来自 `assetsWithPreviews()`）：<br>- `visibility != Hidden`<br>- `deletedAt IS NULL`<br>- INNER JOIN `asset_job_status`<br>- 存在 Preview 类型的 `asset_file`<br><br>**增量条件**：<br>- `smart_search` 表中无对应记录 | ❌ 跳过增量过滤<br><br>**仅保留通用条件**：<br>- `visibility != Hidden`<br>- `deletedAt IS NULL`<br>- INNER JOIN `asset_job_status`<br>- 存在 Preview 文件 |
+| **`streamForVideoConversion`**<br>`$if(!force, ...)`<br>参数：`force?: boolean` | `!force` (falsy 判断) | ✅ 应用增量过滤<br>同 false | ✅ 应用增量过滤<br><br>**通用条件**：<br>- `type = Video`<br>- `deletedAt IS NULL`<br><br>**增量条件**（`$if` 块内）：<br>- 不存在 EncodedVideo 类型的 `asset_file`<br>- `visibility != Hidden` | ❌ 跳过增量过滤<br><br>**⚠️ 仅保留通用条件**：<br>- `type = Video`<br>- `deletedAt IS NULL`<br><br>**注意**：`visibility != Hidden` 在增量块内，force=true 时**包含隐藏视频**！ |
+| **`streamForMetadataExtraction`**<br>`$if(!force, ...)`<br>参数：`force?: boolean` | `!force` (falsy 判断) | ✅ 应用增量过滤<br>同 false | ✅ 应用增量过滤<br><br>**通用条件**：<br>- `deletedAt IS NULL`<br><br>**增量条件**：<br>- LEFT JOIN `asset_job_status`<br>- `metadataExtractedAt IS NULL` **OR**<br>- `asset_job_status.assetId IS NULL` | ❌ 跳过增量过滤<br><br>**⚠️ 仅保留通用条件**：<br>- `deletedAt IS NULL`<br><br>**注意**：**不排除隐藏资产**，包含所有未删除资产！ |
+| **`streamForSidecar`**<br>`$if(!force, ...)`<br>参数：`force?: boolean` | `!force` (falsy 判断) | ✅ 应用增量过滤<br>同 false | ✅ 应用增量过滤<br><br>**通用条件**：<br>- 无（无 `deletedAt` 和 `visibility` 过滤）<br><br>**增量条件**：<br>- 不存在 Sidecar 类型的 `asset_file` | ❌ 跳过增量过滤<br><br>**⚠️ 无任何过滤条件**：<br><br>**注意**：**包含已删除资产和隐藏资产**！范围最大！ |
+| **`streamForDetectFacesJob`**<br>`$if(force === false, ...)`<br>参数：`force?: boolean` | `force === false` (严格相等) | ❌ **不应用**增量过滤<br>（因为 `undefined !== false`）<br><br>**通用条件**（来自 `assetsWithPreviews()`）：<br>- `visibility != Hidden`<br>- `deletedAt IS NULL`<br>- INNER JOIN `asset_job_status`<br>- 存在 Preview 文件 | ✅ 应用增量过滤<br><br>**通用条件** + **增量条件**：<br>- `facesRecognizedAt IS NULL` | ❌ 不应用增量过滤<br><br>**仅保留通用条件**：<br>- `visibility != Hidden`<br>- `deletedAt IS NULL`<br>- INNER JOIN `asset_job_status`<br>- 存在 Preview 文件 |
+| **`streamForOcrJob`**<br>`$if(!force, ...)`<br>参数：`force?: boolean` | `!force` (falsy 判断) | ✅ 应用增量过滤<br>同 false | ✅ 应用增量过滤<br><br>**通用条件**：<br>- `deletedAt IS NULL`<br>- `visibility != Hidden`<br><br>**增量条件**：<br>- INNER JOIN `asset_job_status`<br>- `ocrAt IS NULL` | ❌ 跳过增量过滤<br><br>**仅保留通用条件**：<br>- `deletedAt IS NULL`<br>- `visibility != Hidden` |
+
+---
+
+##### 关键差异总结
+
+1. **判断逻辑差异**：
+
+| 判断方式 | 受影响的方法 | `undefined` 行为 | `false` 行为 |
+|---------|-------------|-----------------|-------------|
+| `!force` (falsy) | 除 `streamForDetectFacesJob` 外的所有方法 | 应用增量过滤 | 应用增量过滤 |
+| `force === false` (严格相等) | `streamForDetectFacesJob` | **不应用**增量过滤 | 应用增量过滤 |
+
+> **注意**：`streamForDetectFacesJob` 是唯一的特殊情况！当 force 未传递时，它会全量处理所有资产（不应用增量过滤）。
+
+2. **`force=true` 时的资产范围差异**：
+
+| 资产范围 | 包含的队列 |
+|---------|-----------|
+| **仅可见+未删除+有预览** | `streamForEncodeClip`、`streamForDetectFacesJob` |
+| **仅可见+未删除** | `streamForThumbnailJob`、`streamForSearchDuplicates`、`streamForOcrJob` |
+| **所有未删除（含隐藏）** | `streamForVideoConversion`、`streamForMetadataExtraction` |
+| **所有资产（含已删除+隐藏）** | `streamForSidecar` |
+
+3. **基础通用条件完整性对比**：
+
+| 方法 | `deletedAt IS NULL` | `visibility != Hidden` | INNER JOIN `asset_job_status` | 必须有 Preview |
+|------|:-------------------:|:----------------------:|:-----------------------------:|:--------------:|
+| `streamForThumbnailJob` | ✅ | ✅ | ⚠️（增量块内） | ❌ |
+| `streamForSearchDuplicates` | ✅ | ✅（via `withDefaultVisibility`） | ⚠️（增量块内） | ❌ |
+| `streamForEncodeClip` | ✅ | ✅ | ✅ | ✅ |
+| `streamForVideoConversion` | ✅ | ❌（增量块内） | ❌ | ❌ |
+| `streamForMetadataExtraction` | ✅ | ❌ | ❌ | ❌ |
+| `streamForSidecar` | ❌ | ❌ | ❌ | ❌ |
+| `streamForDetectFacesJob` | ✅ | ✅ | ✅ | ✅ |
+| `streamForOcrJob` | ✅ | ✅ | ⚠️（增量块内） | ❌ |
 
 ---
 
 ##### 对重跑任务范围的影响总结
 
-| 场景 | force 参数 | 处理范围 | 预计处理量 | 适用场景 |
-|------|-----------|---------|-----------|---------|
-| 初次上传后 | `false` | 仅未处理的新资产 | 小 | 日常增量处理 |
-| 夜间任务 | `false` | 仅未处理的资产 | 中 | 定时补漏 |
-| 部分作业失败后 | `false` | 仅失败的未处理资产 | 小 | 故障恢复（推荐） |
-| 模型升级后 | `true` | 所有资产，先清空旧结果 | 大 | ML 模型版本变更 |
-| 数据损坏后 | `true` | 所有资产，先清空旧结果 | 大 | 数据修复 |
-| 功能开启后 | `false` → 逐步 `true` | 先增量，再全量 | 中→大 | 新功能上线 |
+| 场景 | force 参数 | 处理范围（通用描述） | 预计处理量 | 适用场景 | 不同队列的特殊注意事项 |
+|------|-----------|---------------------|-----------|---------|-----------------------|
+| 初次上传后 | `false` | 仅未处理的新资产 | 小 | 日常增量处理 | - |
+| 夜间任务 | `false` | 仅未处理的资产 | 中 | 定时补漏 | - |
+| 部分作业失败后 | `false` | 仅未处理的资产 | 小 | 故障恢复（推荐） | - |
+| 模型升级后 | `true` | 符合通用条件的所有资产，先清空旧结果 | 大 | ML 模型版本变更 | ⚠️ 注意各队列范围差异：<br>- Sidecar 队列会处理**含已删除**的所有资产<br>- 视频转码/元数据提取会处理**含隐藏**的未删除资产 |
+| 数据损坏后 | `true` | 符合通用条件的所有资产，先清空旧结果 | 大 | 数据修复 | 同上 |
+| 功能开启后 | `false` → 逐步 `true` | 先增量，再全量 | 中→大 | 新功能上线 | ⚠️ 人脸检测队列注意：<br>`force=undefined` 会全量处理（因为使用 `force === false` 判断） |
 
 > **最佳实践**：
 > 1. 常规恢复优先使用 `force=false`，只处理未处理的资产，避免浪费资源
 > 2. 只有在模型升级、数据损坏等特殊场景下才使用 `force=true`
-> 3. `force=true` 会先删除已有结果，期间相关功能可能暂时不可用
+> 3. `force=true` 会先删除已有结果（ML 相关队列），期间相关功能可能暂时不可用
+> 4. ⚠️ **特别注意**：
+>    - `streamForSidecar` 在 `force=true` 时**包含已删除和隐藏资产**，范围最大
+>    - `streamForVideoConversion` 和 `streamForMetadataExtraction` 在 `force=true` 时**包含隐藏资产**
+>    - `streamForDetectFacesJob` 使用严格相等判断，`force=undefined` 与 `force=false` 行为不同
+>    - `streamForEncodeClip` 和 `streamForDetectFacesJob` 要求必须有 Preview 图，范围最严格
 
 ---
 
@@ -878,16 +938,21 @@ private async start(name: QueueName, { force }: QueueCommandDto): Promise<void> 
 
 #### 7.3.3 Repository 层 `force` 参数 SQL 逻辑
 
-| 文件 | 行号 | 说明 |
-|------|------|------|
-| `server/src/repositories/asset-job.repository.ts` | 63-104 | `streamForThumbnailJob()` - 缩略图查询，`$if(!force, ...)` 条件 |
-| `server/src/repositories/asset-job.repository.ts` | 194-208 | `streamForSearchDuplicates()` - 重复检测查询 |
-| `server/src/repositories/asset-job.repository.ts` | 210-218 | `streamForEncodeClip()` - 智能搜索查询 |
-| `server/src/repositories/asset-job.repository.ts` | 313-336 | `streamForVideoConversion()` - 视频转码查询 |
-| `server/src/repositories/asset-job.repository.ts` | 355-369 | `streamForMetadataExtraction()` - 元数据查询 |
-| `server/src/repositories/asset-job.repository.ts` | 418-437 | `streamForSidecar()` - Sidecar 文件查询 |
-| `server/src/repositories/asset-job.repository.ts` | 439-446 | `streamForDetectFacesJob()` - 人脸检测查询 |
-| `server/src/repositories/asset-job.repository.ts` | 448-461 | `streamForOcrJob()` - OCR 查询 |
+| 方法名 | 参数类型 | `$if` 条件判断 | 行号 | 关键特征 |
+|--------|---------|---------------|------|---------|
+| `streamForThumbnailJob` | `boolean \| undefined` | `!options.force` | `asset-job.repository.ts:63-104` | 条件最复杂，5 种 OR 条件 + fullsizeEnabled 扩展 |
+| `streamForSearchDuplicates` | `force?: boolean` | `!force` | `asset-job.repository.ts:194-208` | 必须 INNER JOIN `smart_search`（已有 embedding） |
+| `streamForEncodeClip` | `force?: boolean` | `!force` | `asset-job.repository.ts:210-218` | 通过 `assetsWithPreviews()` 隐含严格过滤 |
+| `streamForVideoConversion` | `force?: boolean` | `!force` | `asset-job.repository.ts:313-336` | `visibility != Hidden` 在增量块内，force=true 包含隐藏 |
+| `streamForMetadataExtraction` | `force?: boolean` | `!force` | `asset-job.repository.ts:355-369` | LEFT JOIN，允许 `asset_job_status` 无记录 |
+| `streamForSidecar` | `force?: boolean` | `!force` | `asset-job.repository.ts:418-437` | **无任何通用过滤**，force=true 范围最大 |
+| `streamForDetectFacesJob` | `force?: boolean` | `force === false` | `asset-job.repository.ts:439-446` | **唯一使用严格相等**，undefined 行为特殊 |
+| `streamForOcrJob` | `force?: boolean` | `!force` | `asset-job.repository.ts:448-461` | 标准的 `deletedAt` + `visibility` 通用过滤 |
+
+**辅助方法**：
+| 方法名 | 行号 | 说明 |
+|--------|------|------|
+| `assetsWithPreviews()` | `asset-job.repository.ts:178-192` | 私有辅助方法，提供严格的通用过滤条件（非隐藏、未删除、有 Preview） |
 
 ### 7.4 DTO 与枚举
 
