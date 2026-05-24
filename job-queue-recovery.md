@@ -340,20 +340,260 @@ onJobError({ job }: ArgOf<'JobError'>) {
 
 ### 5.4 手动恢复路径
 
-由于无自动重试，失败恢复完全依赖手动操作：
+由于无自动重试，失败恢复完全依赖手动操作。需要特别注意**新旧两套接口的功能差异**。
 
-#### 5.4.1 API 操作
+---
 
-通过 `QueueController` 提供的接口：
+#### 5.4.1 新旧接口映射关系
 
-| 操作 | 说明 |
-|------|------|
-| `POST /api/queues/:name` | 重新触发全量作业（如重新生成所有缩略图） |
-| `PUT /api/queues/:name` | 暂停/恢复队列 |
-| `DELETE /api/queues/:name` | 清空队列，可选同时清除失败作业 |
-| `GET /api/queues/:name/jobs` | 查询失败作业列表 |
+Immich 存在两套队列运维接口，**启动队列的功能仅存在于旧接口**：
 
-#### 5.4.2 清除失败作业
+| 控制器 | 路由前缀 | 接口版本 | 核心功能 | 关键限制 |
+|--------|---------|---------|---------|---------|
+| `JobController` | `/jobs` | **旧接口** (v1/v2) | ✅ 启动队列 (start)<br>✅ 暂停/恢复队列<br>✅ 清空队列<br>✅ 清除失败作业<br>✅ 创建手动作业 | `PUT /jobs/:name` 是**唯一**能启动队列的入口 |
+| `QueueController` | `/queues` | **新接口** (v2.4.0 alpha) | ✅ 查询队列列表/详情<br>✅ 暂停/恢复队列<br>✅ 清空队列<br>✅ 查询作业列表 | ❌ **无启动队列功能** |
+
+> ⚠️ **重要提醒**：手动重跑操作（重新生成缩略图、重新识别等）必须通过 `PUT /api/jobs/:name` 旧接口进行，`/api/queues` 新接口不支持启动操作。
+
+---
+
+#### 5.4.2 接口详细说明
+
+##### 旧接口（/jobs 前缀）
+
+| HTTP 方法 | 路径 | 功能 | 说明 |
+|----------|------|------|------|
+| `GET` | `/api/jobs` | 查询队列状态（已废弃） | 返回所有队列的作业计数和状态，v2.4.0 起废弃 |
+| `POST` | `/api/jobs` | 创建手动作业 | 触发清理类任务：人员清理、标签清理、用户清理、记忆清理、记忆生成、数据库备份 |
+| `PUT` | `/api/jobs/:name` | 执行队列命令 | **唯一支持 start 命令的接口**，支持：`start`、`pause`、`resume`、`empty`、`clear-failed` |
+
+##### 新接口（/queues 前缀）
+
+| HTTP 方法 | 路径 | 功能 | 说明 |
+|----------|------|------|------|
+| `GET` | `/api/queues` | 查询所有队列 | 返回队列名称、暂停状态、统计信息 |
+| `GET` | `/api/queues/:name` | 查询单个队列 | 返回指定队列的详细信息 |
+| `PUT` | `/api/queues/:name` | 更新队列状态 | 仅支持 `isPaused` 参数，用于暂停/恢复 |
+| `GET` | `/api/queues/:name/jobs` | 查询队列作业 | 可按状态筛选（active/failed/completed/delayed/waiting/paused） |
+| `DELETE` | `/api/queues/:name/jobs` | 清空队列 | 清空等待中的作业，可选择同时清理失败作业 |
+
+---
+
+#### 5.4.3 队列可操作权限清单
+
+共 18 个队列，按操作权限分类：
+
+| 队列名称 | 可启动 (start) | 可暂停 (pause) | 可清空 (empty) | 触发的批量作业 |
+|---------|:--------------:|:--------------:|:--------------:|---------------|
+| `ThumbnailGeneration` | ✅ | ✅ | ✅ | `AssetGenerateThumbnailsQueueAll` |
+| `MetadataExtraction` | ✅ | ✅ | ✅ | `AssetExtractMetadataQueueAll` |
+| `VideoConversion` | ✅ | ✅ | ✅ | `AssetEncodeVideoQueueAll` |
+| `FaceDetection` | ✅ | ✅ | ✅ | `AssetDetectFacesQueueAll` |
+| `FacialRecognition` | ✅ | ✅ | ✅ | `FacialRecognitionQueueAll` |
+| `SmartSearch` | ✅ | ✅ | ✅ | `SmartSearchQueueAll` |
+| `DuplicateDetection` | ✅ | ✅ | ✅ | `AssetDetectDuplicatesQueueAll` |
+| `Sidecar` | ✅ | ✅ | ✅ | `SidecarQueueAll` |
+| `Library` | ✅ | ✅ | ✅ | `LibraryScanQueueAll` |
+| `BackupDatabase` | ✅ | ✅ | ✅ | `DatabaseBackup` |
+| `Ocr` | ✅ | ✅ | ✅ | `OcrQueueAll` |
+| `StorageTemplateMigration` | ✅ | ✅ | ✅ | `StorageTemplateMigration` |
+| `Migration` | ✅ | ✅ | ✅ | `FileMigrationQueueAll` |
+| `Search` | ❌ | ✅ | ✅ | - |
+| `Notification` | ❌ | ✅ | ✅ | - |
+| `Workflow` | ❌ | ✅ | ✅ | - |
+| `Editor` | ❌ | ✅ | ✅ | - |
+| `BackgroundTask` | ❌ | ❌ | ✅ | - |
+
+> **说明**：
+> - ✅ **可启动的队列**（13个）：均有对应的 `*QueueAll` 批量作业
+> - ❌ **不可启动的队列**（5个）：均为事件驱动，无批量作业入口
+> - ❌ **不可暂停的队列**（1个）：`BackgroundTask` 队列包含系统关键任务，禁止暂停
+
+---
+
+#### 5.4.4 按接口分组的恢复操作清单
+
+##### 📋 通过旧接口 `PUT /api/jobs/:name` 的恢复操作
+
+**启动队列（重新处理所有资产）**：
+```bash
+# 重新生成所有缩略图
+curl -X PUT /api/jobs/thumbnailGeneration \
+  -H "Content-Type: application/json" \
+  -d '{"command": "start", "force": false}'
+
+# 强制重新生成所有缩略图（跳过已处理）
+curl -X PUT /api/jobs/thumbnailGeneration \
+  -H "Content-Type: application/json" \
+  -d '{"command": "start", "force": true}'
+
+# 重新提取所有元数据
+curl -X PUT /api/jobs/metadataExtraction \
+  -H "Content-Type: application/json" \
+  -d '{"command": "start", "force": false}'
+
+# 重新识别人脸
+curl -X PUT /api/jobs/faceDetection \
+  -H "Content-Type: application/json" \
+  -d '{"command": "start", "force": false}'
+
+# 重新进行人脸识别聚类
+curl -X PUT /api/jobs/facialRecognition \
+  -H "Content-Type: application/json" \
+  -d '{"command": "start", "force": false}'
+
+# 重新向量化（智能搜索）
+curl -X PUT /api/jobs/smartSearch \
+  -H "Content-Type: application/json" \
+  -d '{"command": "start", "force": false}'
+
+# 重新进行重复检测
+curl -X PUT /api/jobs/duplicateDetection \
+  -H "Content-Type: application/json" \
+  -d '{"command": "start", "force": false}'
+
+# 重新进行 OCR 识别
+curl -X PUT /api/jobs/ocr \
+  -H "Content-Type: application/json" \
+  -d '{"command": "start", "force": false}'
+```
+
+**其他旧接口命令**：
+```bash
+# 暂停队列（已废弃，建议用新接口）
+curl -X PUT /api/jobs/thumbnailGeneration \
+  -H "Content-Type: application/json" \
+  -d '{"command": "pause"}'
+
+# 恢复队列（已废弃，建议用新接口）
+curl -X PUT /api/jobs/thumbnailGeneration \
+  -H "Content-Type: application/json" \
+  -d '{"command": "resume"}'
+
+# 清空队列（已废弃，建议用新接口）
+curl -X PUT /api/jobs/thumbnailGeneration \
+  -H "Content-Type: application/json" \
+  -d '{"command": "empty"}'
+
+# 清除失败作业（已废弃，建议用新接口）
+curl -X PUT /api/jobs/thumbnailGeneration \
+  -H "Content-Type: application/json" \
+  -d '{"command": "clear-failed"}'
+```
+
+##### 📋 通过新接口 `/api/queues` 的恢复操作
+
+**查询失败作业**：
+```bash
+# 查询缩略图队列的失败作业
+curl /api/queues/thumbnailGeneration/jobs?status=failed
+
+# 查询所有状态的作业
+curl /api/queues/thumbnailGeneration/jobs
+```
+
+**暂停/恢复队列**：
+```bash
+# 暂停队列
+curl -X PUT /api/queues/thumbnailGeneration \
+  -H "Content-Type: application/json" \
+  -d '{"isPaused": true}'
+
+# 恢复队列
+curl -X PUT /api/queues/thumbnailGeneration \
+  -H "Content-Type: application/json" \
+  -d '{"isPaused": false}'
+```
+
+**清空队列**：
+```bash
+# 仅清空等待中的作业
+curl -X DELETE /api/queues/thumbnailGeneration/jobs \
+  -H "Content-Type: application/json" \
+  -d '{}'
+
+# 清空等待中的作业 + 清除失败作业
+curl -X DELETE /api/queues/thumbnailGeneration/jobs \
+  -H "Content-Type: application/json" \
+  -d '{"failed": true}'
+```
+
+##### 📋 通过 `POST /api/jobs` 的手动作业
+
+```bash
+# 人员清理
+curl -X POST /api/jobs \
+  -H "Content-Type: application/json" \
+  -d '{"name": "person-cleanup"}'
+
+# 标签清理
+curl -X POST /api/jobs \
+  -H "Content-Type: application/json" \
+  -d '{"name": "tag-cleanup"}'
+
+# 用户清理
+curl -X POST /api/jobs \
+  -H "Content-Type: application/json" \
+  -d '{"name": "user-cleanup"}'
+
+# 记忆清理
+curl -X POST /api/jobs \
+  -H "Content-Type: application/json" \
+  -d '{"name": "memory-cleanup"}'
+
+# 生成记忆
+curl -X POST /api/jobs \
+  -H "Content-Type: application/json" \
+  -d '{"name": "memory-create"}'
+
+# 数据库备份
+curl -X POST /api/jobs \
+  -H "Content-Type: application/json" \
+  -d '{"name": "backup-database"}'
+```
+
+---
+
+#### 5.4.5 标准恢复流程建议
+
+**典型故障恢复步骤**：
+
+1. **查询失败作业**：
+   ```bash
+   curl /api/queues/thumbnailGeneration/jobs?status=failed
+   ```
+
+2. **清除失败作业**（如需）：
+   ```bash
+   curl -X DELETE /api/queues/thumbnailGeneration/jobs \
+     -H "Content-Type: application/json" \
+     -d '{"failed": true}'
+   ```
+
+3. **暂停队列**（如需）：
+   ```bash
+   curl -X PUT /api/queues/thumbnailGeneration \
+     -H "Content-Type: application/json" \
+     -d '{"isPaused": true}'
+   ```
+
+4. **重新触发处理**（**必须使用旧接口**）：
+   ```bash
+   curl -X PUT /api/jobs/thumbnailGeneration \
+     -H "Content-Type: application/json" \
+     -d '{"command": "start", "force": false}'
+   ```
+
+5. **恢复队列**（如果之前暂停了）：
+   ```bash
+   curl -X PUT /api/queues/thumbnailGeneration \
+     -H "Content-Type: application/json" \
+     -d '{"isPaused": false}'
+   ```
+
+---
+
+#### 5.4.6 清除失败作业（代码实现）
 
 ```typescript
 // queue.service.ts:126-130
@@ -364,7 +604,9 @@ case QueueCommand.ClearFailed: {
 }
 ```
 
-#### 5.4.3 重新触发队列
+---
+
+#### 5.4.7 重新触发队列（代码实现）
 
 ```typescript
 // queue.service.ts:185-250
@@ -377,10 +619,48 @@ private async start(name: QueueName, { force }: QueueCommandDto): Promise<void> 
   switch (name) {
     case QueueName.ThumbnailGeneration:
       return this.jobRepository.queue({ name: JobName.AssetGenerateThumbnailsQueueAll, data: { force } });
-    // ... 其他队列
+    case QueueName.MetadataExtraction:
+      return this.jobRepository.queue({ name: JobName.AssetExtractMetadataQueueAll, data: { force } });
+    case QueueName.FaceDetection:
+      return this.jobRepository.queue({ name: JobName.AssetDetectFacesQueueAll, data: { force } });
+    case QueueName.FacialRecognition:
+      return this.jobRepository.queue({ name: JobName.FacialRecognitionQueueAll, data: { force } });
+    case QueueName.SmartSearch:
+      return this.jobRepository.queue({ name: JobName.SmartSearchQueueAll, data: { force } });
+    case QueueName.DuplicateDetection:
+      return this.jobRepository.queue({ name: JobName.AssetDetectDuplicatesQueueAll, data: { force } });
+    case QueueName.Ocr:
+      return this.jobRepository.queue({ name: JobName.OcrQueueAll, data: { force } });
+    case QueueName.VideoConversion:
+      return this.jobRepository.queue({ name: JobName.AssetEncodeVideoQueueAll, data: { force } });
+    case QueueName.Sidecar:
+      return this.jobRepository.queue({ name: JobName.SidecarQueueAll, data: { force } });
+    case QueueName.Library:
+      return this.jobRepository.queue({ name: JobName.LibraryScanQueueAll, data: { force } });
+    case QueueName.BackupDatabase:
+      return this.jobRepository.queue({ name: JobName.DatabaseBackup, data: { force } });
+    case QueueName.StorageTemplateMigration:
+      return this.jobRepository.queue({ name: JobName.StorageTemplateMigration });
+    case QueueName.Migration:
+      return this.jobRepository.queue({ name: JobName.FileMigrationQueueAll });
+    default:
+      throw new BadRequestException(`Invalid job name: ${name}`);
   }
 }
 ```
+
+---
+
+#### 5.4.8 关键代码索引
+
+| 文件 | 行号 | 说明 |
+|------|------|------|
+| `server/src/controllers/job.controller.ts` | 45-58 | 旧接口 `PUT /jobs/:name` - 唯一支持 start 命令 |
+| `server/src/controllers/queue.controller.ts` | 44-57 | 新接口 `PUT /queues/:name` - 仅支持暂停/恢复 |
+| `server/src/controllers/queue.controller.ts` | 74-84 | 新接口 `DELETE /queues/:name/jobs` - 清空队列 |
+| `server/src/services/queue.service.ts` | 102-136 | `runCommandLegacy()` - 旧接口命令分发 |
+| `server/src/services/queue.service.ts` | 185-250 | `start()` - 启动队列的核心实现 |
+| `server/src/enum.ts` | 874-884 | `QueueCommand` 枚举 - 5 种命令类型 |
 
 ### 5.5 特殊场景的重试机制
 
@@ -417,6 +697,8 @@ private async start(name: QueueName, { force }: QueueCommandDto): Promise<void> 
 
 ## 七、关键代码索引
 
+### 7.1 核心架构
+
 | 文件 | 行号 | 说明 |
 |------|------|------|
 | `server/src/repositories/job.repository.ts` | 36-84 | 作业处理器发现与注册 |
@@ -431,3 +713,36 @@ private async start(name: QueueName, { force }: QueueCommandDto): Promise<void> 
 | `server/src/repositories/config.repository.ts` | 281-292 | BullMQ 全局配置 |
 | `server/src/config.ts` | 228-243 | 默认并发配置 |
 | `server/src/decorators.ts` | 150-154 | @OnJob 装饰器 |
+
+### 7.2 控制器与接口
+
+| 文件 | 行号 | 说明 |
+|------|------|------|
+| `server/src/controllers/job.controller.ts` | 1-59 | 旧接口控制器（/jobs 前缀） |
+| `server/src/controllers/job.controller.ts` | 21-43 | `GET /jobs` 和 `POST /jobs` 接口 |
+| `server/src/controllers/job.controller.ts` | 45-58 | `PUT /jobs/:name` - **唯一支持 start 命令的接口** |
+| `server/src/controllers/queue.controller.ts` | 1-85 | 新接口控制器（/queues 前缀） |
+| `server/src/controllers/queue.controller.ts` | 22-31 | `GET /queues` 查询所有队列 |
+| `server/src/controllers/queue.controller.ts` | 33-42 | `GET /queues/:name` 查询单个队列 |
+| `server/src/controllers/queue.controller.ts` | 44-57 | `PUT /queues/:name` 暂停/恢复队列（不支持 start） |
+| `server/src/controllers/queue.controller.ts` | 59-72 | `GET /queues/:name/jobs` 查询队列作业 |
+| `server/src/controllers/queue.controller.ts` | 74-84 | `DELETE /queues/:name/jobs` 清空队列 |
+
+### 7.3 业务逻辑层
+
+| 文件 | 行号 | 说明 |
+|------|------|------|
+| `server/src/services/queue.service.ts` | 102-136 | `runCommandLegacy()` - 旧接口命令分发（start/pause/resume/empty/clear-failed） |
+| `server/src/services/queue.service.ts` | 151-164 | `update()` - 新接口暂停/恢复逻辑 |
+| `server/src/services/queue.service.ts` | 170-175 | `emptyQueue()` - 新接口清空队列逻辑 |
+| `server/src/services/queue.service.ts` | 185-250 | `start()` - **启动队列的核心实现**，13 个可启动队列的 switch case |
+
+### 7.4 DTO 与枚举
+
+| 文件 | 行号 | 说明 |
+|------|------|------|
+| `server/src/enum.ts` | 759-778 | `QueueName` 枚举 - 18 个队列名称 |
+| `server/src/enum.ts` | 874-884 | `QueueCommand` 枚举 - 5 种命令类型（start/pause/resume/empty/clear-failed） |
+| `server/src/dtos/queue.dto.ts` | 1-76 | 新接口 DTO 定义 |
+| `server/src/dtos/queue-legacy.dto.ts` | 1-64 | 旧接口 DTO 与转换函数 |
+| `server/src/dtos/job.dto.ts` | 1-11 | 手动作业 DTO（POST /jobs） |
