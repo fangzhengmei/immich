@@ -70,7 +70,11 @@ ALTER TABLE "users" ADD CONSTRAINT "UQ_b309cf34fa58137c416b32cea3a" UNIQUE ("sto
    - `unlink()` 操作是将 `oauthId` 设为 `''` 而非 `null`
    - 邮箱匹配时检查 `if (emailUser.oauthId)`，空字符串会被判定为 falsy
 
-4. **已删除用户不清理**：软删除（`deletedAt` 非空）的用户其 `oauthId` 仍保留在数据库中，`getByOAuthId()` 方法可能返回已删除用户。
+4. **已删除用户不参与匹配（重要修正）**：软删除（`deletedAt` 非空）的用户其 `oauthId` 虽保留在数据库中，但所有关键查询方法都排除了已删除用户：
+   - `getByOAuthId()` (`user.repository.ts:144-152`): `.where('user.deletedAt', 'is', null)`
+   - `getByEmail()` (`user.repository.ts:122-131`): `.where('user.deletedAt', 'is', null)`
+   - `update()` (`user.repository.ts:183-192`): `.where('user.deletedAt', 'is', null)`
+   - 因此**已删除账号不会参与外部身份ID匹配**，也不会被误更新
 
 5. **业务层唯一性保障**：唯一性完全由应用层代码保证：
    - 自动合并时检查目标账号是否已有 `oauthId`
@@ -240,6 +244,22 @@ const normalizedEmail = profile.email ? profile.email.trim().toLowerCase() : und
 | 邮箱匹配 + 用户已有 `oauthId` (非空) | **拒绝登录** | 抛出冲突异常，防止账号劫持 |
 | 邮箱无匹配 | 进入自动注册 | 可能创建新账号 |
 
+**自动登录冲突的返回信息特征** (`auth.service.ts:322-326`)：
+
+```typescript
+if (emailUser.oauthId) {
+  this.logger.debug('OAuth login conflict: email already linked to different account');
+  throw new BadRequestException('OAuth authentication failed');
+}
+```
+
+| 维度 | 表现 |
+|------|------|
+| 日志级别 | `debug` |
+| 日志内容 | `"OAuth login conflict: email already linked to different account"` |
+| 用户返回 | 通用错误：`"OAuth authentication failed"` |
+| 信息暴露 | 不透露具体冲突原因，防止用户枚举 |
+
 > **sub 变更后的实际行为**：如果 OAuth 提供者的 `sub` 发生变化（例如重新安装 OAuth 提供者、重建用户），系统行为分三种情况：
 > 1. **已执行 `unlink` 或 `unlinkAll`**：邮箱匹配成功且 `oauthId=''` → 自动合并，绑定新 sub
 > 2. **未解绑但邮箱匹配**：`oauthId` 仍为旧值（非空）→ 拒绝登录（冲突）
@@ -345,6 +365,23 @@ const user = await this.userRepository.update(auth.user.id, { oauthId });
 ```
 
 **关键区别**：与自动合并不同，手动链接时**不进行邮箱匹配**，直接绑定到当前登录用户。但会检查该 OAuth ID 是否已被其他用户占用。
+
+**手动绑定冲突的返回信息特征** (`auth.service.ts:423-427`)：
+
+```typescript
+const duplicate = await this.userRepository.getByOAuthId(oauthId);
+if (duplicate && duplicate.id !== auth.user.id) {
+  this.logger.warn(`OAuth link account failed: sub is already linked to another user (${duplicate.email}).`);
+  throw new BadRequestException('This OAuth account has already been linked to another user.');
+}
+```
+
+| 维度 | 表现 |
+|------|------|
+| 日志级别 | `warn` |
+| 日志内容 | 包含冲突用户邮箱：`"OAuth link account failed: sub is already linked to another user (user@example.com)."` |
+| 用户返回 | 明确错误：`"This OAuth account has already been linked to another user."` |
+| 信息暴露 | 用户已登录，安全风险较低，可透露具体原因 |
 
 ---
 
@@ -461,6 +498,9 @@ async unlinkAll(_auth: AuthDto) {
 | 匹配键优先级 | 1. `oauthId` → 2. `email` | 直接绑定当前用户 |
 | 邮箱自动合并 | 支持（`oauthId` 为空时） | 不检查邮箱，直接绑定 |
 | 冲突处理 | 邮箱已绑定其他 OAuth ID 时拒绝 | `oauthId` 已被其他用户使用时拒绝 |
+| 冲突错误信息 | 通用：`"OAuth authentication failed"` | 明确：`"This OAuth account has already been linked to another user."` |
+| 冲突日志级别 | `debug` | `warn` |
+| 冲突日志内容 | 不含用户敏感信息 | 含冲突用户邮箱 |
 | 自动注册 | 支持（`autoRegister=true`） | 不涉及 |
 | 会话存储 | 自动存储 `oauthSid` | 更新当前会话的 `oauthSid` |
 | 适用场景 | 普通用户登录、首次登录合并已有账号 | 用户主动关联外部身份 |
@@ -475,14 +515,12 @@ async unlinkAll(_auth: AuthDto) {
 2. **冲突防止**：
    - 自动合并时检查目标账号是否已有 `oauthId`（非空字符串）
    - 手动绑定时检查 `oauthId` 是否已被其他用户占用
-   - 冲突时直接抛出通用错误信息，不暴露具体原因（防止用户枚举）
+   - 自动登录冲突场景返回通用错误信息，不暴露具体原因（防止用户枚举）
 
-3. **安全日志** (`auth.service.ts:325-326`)：
-   ```typescript
-   this.logger.debug('OAuth login conflict: email already linked to different account');
-   throw new BadRequestException('OAuth authentication failed');
-   ```
-   - 详细错误仅记录日志，用户只看到通用错误信息
+3. **安全日志与错误信息分级**：
+   - **自动登录冲突** (`auth.service.ts:324-326`)：`debug` 级别日志 + 通用错误信息，不暴露具体冲突原因，防止攻击者枚举已注册邮箱
+   - **手动绑定冲突** (`auth.service.ts:424-426`)：`warn` 级别日志 + 明确错误信息，包含冲突用户邮箱（用户已登录，安全风险较低）
+   - 两种场景都将详细信息记录在服务端日志，用户侧根据认证状态区分信息暴露程度
 
 4. **密码登录防护**：OAuth 用户的 `password` 字段默认为空字符串，密码登录时会验证失败
 
@@ -535,3 +573,24 @@ A: 可以。如果 Logout Token 同时包含 `sid` 和 `sub`，会精确匹配�
 
 **Q: 为什么 `oauthId` 没有数据库 UNIQUE 约束？**
 A: 历史设计选择。这允许多个用户同时处于未绑定状态（`oauthId=''`），但也带来了竞态风险。应用层通过前置检查尽量避免冲突，但理论上存在 TOCTOU 漏洞。代码中已有 TODO 注释计划将 `oauthId` 改为 nullable，未来可能添加条件唯一索引。
+
+**Q: 已删除的用户会影响 OAuth 匹配吗？**
+A: **不会**。所有关键查询方法（`getByOAuthId`、`getByEmail`、`update`）都显式排除了软删除用户（`deletedAt IS NULL`）。已删除用户的 `oauthId` 虽保留在数据库中，但不会参与任何匹配或更新操作。
+
+**Q: 运维排障时如何区分两种冲突？**
+A: 通过两个关键特征快速判断：
+
+| 判断依据 | 自动登录冲突 | 手动绑定冲突 |
+|---------|-------------|-------------|
+| 用户返回信息 | 通用错误 `OAuth authentication failed` | 明确错误 `This OAuth account has already been linked to another user.` |
+| 日志级别 | `debug`（需开启 debug 日志） | `warn`（默认日志级别即可看到） |
+| 日志内容 | 不含邮箱，仅说明冲突 | 包含冲突用户的邮箱地址 |
+| 发生阶段 | OAuth 回调登录时 | 已登录用户主动绑定时 |
+
+**排障建议**：
+1. 用户报告"OAuth authentication failed"但无其他信息 → 检查 debug 日志，查找是否有邮箱冲突
+2. 日志中出现 warn 级别的绑定冲突 → 说明是已登录用户的手动绑定操作
+3. 需特别注意：自动登录冲突默认不记录 warn 日志，容易被忽略，建议排障时主动开启 debug 级别
+
+**Q: 自动登录冲突为什么不返回具体原因？**
+A: 安全设计。自动登录是公开端点，任何人都可以调用，返回模糊错误可防止攻击者枚举已注册邮箱。运维需查看服务端 debug 日志才能定位具体原因。而手动绑定需要用户先登录，身份已确认，可以返回更详细的错误信息帮助用户理解问题。
