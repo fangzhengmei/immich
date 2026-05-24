@@ -70,11 +70,20 @@ ALTER TABLE "users" ADD CONSTRAINT "UQ_b309cf34fa58137c416b32cea3a" UNIQUE ("sto
    - `unlink()` 操作是将 `oauthId` 设为 `''` 而非 `null`
    - 邮箱匹配时检查 `if (emailUser.oauthId)`，空字符串会被判定为 falsy
 
-4. **已删除用户不参与匹配（重要修正）**：软删除（`deletedAt` 非空）的用户其 `oauthId` 虽保留在数据库中，但所有关键查询方法都排除了已删除用户：
+4. **已删除用户的行为边界（重要修正，需区分两类操作）**：软删除（`deletedAt` 非空）的用户其 `oauthId` 虽保留在数据库中，但不同类型操作的行为不同：
+
+   **🔍 匹配查询类操作（过滤已删除用户）**：
    - `getByOAuthId()` (`user.repository.ts:144-152`): `.where('user.deletedAt', 'is', null)`
    - `getByEmail()` (`user.repository.ts:122-131`): `.where('user.deletedAt', 'is', null)`
-   - `update()` (`user.repository.ts:183-192`): `.where('user.deletedAt', 'is', null)`
-   - 因此**已删除账号不会参与外部身份ID匹配**，也不会被误更新
+   - `update()` (单个用户更新, `user.repository.ts:183-192`): `.where('user.deletedAt', 'is', null)`
+
+   **⚠️ 批量更新类操作（不过滤已删除用户）**：
+   - `updateAll()` (`user.repository.ts:194-196`): 无 `deletedAt` 过滤条件，会更新所有用户
+
+   **关键结论**：
+   - ✅ 已删除账号**不会参与外部身份ID匹配**（匹配查询都过滤了已删除用户）
+   - ✅ 已删除账号**不会被单个更新操作误修改**（单个 `update` 也过滤已删除用户）
+   - ❌ 已删除账号**会被批量更新操作修改**（`updateAll` / `unlinkAll` 没有过滤条件）
 
 5. **业务层唯一性保障**：唯一性完全由应用层代码保证：
    - 自动合并时检查目标账号是否已有 `oauthId`
@@ -671,7 +680,10 @@ A: 可以。如果 Logout Token 同时包含 `sid` 和 `sub`，会精确匹配�
 A: 历史设计选择。这允许多个用户同时处于未绑定状态（`oauthId=''`），但也带来了竞态风险。应用层通过前置检查尽量避免冲突，但理论上存在 TOCTOU 漏洞。代码中已有 TODO 注释计划将 `oauthId` 改为 nullable，未来可能添加条件唯一索引。
 
 **Q: 已删除的用户会影响 OAuth 匹配吗？**
-A: **不会**。所有关键查询方法（`getByOAuthId`、`getByEmail`、`update`）都显式排除了软删除用户（`deletedAt IS NULL`）。已删除用户的 `oauthId` 虽保留在数据库中，但不会参与任何匹配或更新操作。
+A: **不会影响匹配，但会被批量更新操作修改**，需明确区分两类操作：
+- ✅ **匹配查询**：`getByOAuthId`、`getByEmail` 都显式排除软删除用户（`deletedAt IS NULL`），已删除用户不会参与任何账号匹配
+- ✅ **单个更新**：`update()` (单个用户) 也排除软删除用户，不会被误更新
+- ❌ **批量更新**：`updateAll()` / `unlinkAll` 没有 `deletedAt` 过滤条件，已删除用户的 `oauthId` 也会被重置为空字符串（但无实际业务影响）
 
 **Q: 运维排障时如何区分两种冲突？**
 A: 通过两个关键特征快速判断：
