@@ -526,7 +526,7 @@ streamForThumbnailJob(options: { force: boolean | undefined; ... }) {
 | **`streamForVideoConversion`**<br>`$if(!force, ...)`<br>参数：`force?: boolean` | `!force` (falsy 判断) | ✅ 应用增量过滤<br>同 false | ✅ 应用增量过滤<br><br>**通用条件**：<br>- `type = Video`<br>- `deletedAt IS NULL`<br><br>**增量条件**（`$if` 块内）：<br>- 不存在 EncodedVideo 类型的 `asset_file`<br>- `visibility != Hidden` | ❌ 跳过增量过滤<br><br>**⚠️ 仅保留通用条件**：<br>- `type = Video`<br>- `deletedAt IS NULL`<br><br>**注意**：`visibility != Hidden` 在增量块内，force=true 时**包含隐藏视频**！ |
 | **`streamForMetadataExtraction`**<br>`$if(!force, ...)`<br>参数：`force?: boolean` | `!force` (falsy 判断) | ✅ 应用增量过滤<br>同 false | ✅ 应用增量过滤<br><br>**通用条件**：<br>- `deletedAt IS NULL`<br><br>**增量条件**：<br>- LEFT JOIN `asset_job_status`<br>- `metadataExtractedAt IS NULL` **OR**<br>- `asset_job_status.assetId IS NULL` | ❌ 跳过增量过滤<br><br>**⚠️ 仅保留通用条件**：<br>- `deletedAt IS NULL`<br><br>**注意**：**不排除隐藏资产**，包含所有未删除资产！ |
 | **`streamForSidecar`**<br>`$if(!force, ...)`<br>参数：`force?: boolean` | `!force` (falsy 判断) | ✅ 应用增量过滤<br>同 false | ✅ 应用增量过滤<br><br>**通用条件**：<br>- 无（无 `deletedAt` 和 `visibility` 过滤）<br><br>**增量条件**：<br>- 不存在 Sidecar 类型的 `asset_file` | ❌ 跳过增量过滤<br><br>**⚠️ 无任何过滤条件**：<br><br>**注意**：**包含已删除资产和隐藏资产**！范围最大！ |
-| **`streamForDetectFacesJob`**<br>`$if(force === false, ...)`<br>参数：`force?: boolean` | `force === false` (严格相等) | ❌ **不应用**增量过滤<br>（因为 `undefined !== false`）<br><br>**通用条件**（来自 `assetsWithPreviews()`）：<br>- `visibility != Hidden`<br>- `deletedAt IS NULL`<br>- INNER JOIN `asset_job_status`<br>- 存在 Preview 文件 | ✅ 应用增量过滤<br><br>**通用条件** + **增量条件**：<br>- `facesRecognizedAt IS NULL` | ❌ 不应用增量过滤<br><br>**仅保留通用条件**：<br>- `visibility != Hidden`<br>- `deletedAt IS NULL`<br>- INNER JOIN `asset_job_status`<br>- 存在 Preview 文件 |
+| **`streamForDetectFacesJob`**<br>`$if(force === false, ...)`<br>参数：`force?: boolean` | `force === false` (严格相等) | ❌ **不应用**增量过滤<br>（因为 `undefined !== false`）<br><br>**通用条件**（来自 `assetsWithPreviews()`）：<br>- `visibility != Hidden`<br>- `deletedAt IS NULL`<br>- INNER JOIN `asset_job_status`<br>- 存在 Preview 类型的 `asset_file`<br><br>**注意**：并非"所有资产"，而是"有 Preview 图的未删除、非隐藏资产" | ✅ 应用增量过滤<br><br>**通用条件** + **增量条件**：<br>- `facesRecognizedAt IS NULL` | ❌ 不应用增量过滤<br><br>**仅保留通用条件**：<br>- `visibility != Hidden`<br>- `deletedAt IS NULL`<br>- INNER JOIN `asset_job_status`<br>- 存在 Preview 类型的 `asset_file` |
 | **`streamForOcrJob`**<br>`$if(!force, ...)`<br>参数：`force?: boolean` | `!force` (falsy 判断) | ✅ 应用增量过滤<br>同 false | ✅ 应用增量过滤<br><br>**通用条件**：<br>- `deletedAt IS NULL`<br>- `visibility != Hidden`<br><br>**增量条件**：<br>- INNER JOIN `asset_job_status`<br>- `ocrAt IS NULL` | ❌ 跳过增量过滤<br><br>**仅保留通用条件**：<br>- `deletedAt IS NULL`<br>- `visibility != Hidden` |
 
 ---
@@ -540,7 +540,7 @@ streamForThumbnailJob(options: { force: boolean | undefined; ... }) {
 | `!force` (falsy) | 除 `streamForDetectFacesJob` 外的所有方法 | 应用增量过滤 | 应用增量过滤 |
 | `force === false` (严格相等) | `streamForDetectFacesJob` | **不应用**增量过滤 | 应用增量过滤 |
 
-> **注意**：`streamForDetectFacesJob` 是唯一的特殊情况！当 force 未传递时，它会全量处理所有资产（不应用增量过滤）。
+> **注意**：`streamForDetectFacesJob` 是唯一的特殊情况！当 force 未传递（`undefined`）时，它**不会**应用增量过滤，会处理所有符合基础条件的资产。但"基础条件"本身已经有严格限制，并非"所有资产"。详细分析见下文"人脸检测队列实际选取范围"小节。
 
 2. **`force=true` 时的资产范围差异**：
 
@@ -566,6 +566,138 @@ streamForThumbnailJob(options: { force: boolean | undefined; ... }) {
 
 ---
 
+##### 人脸检测队列实际选取范围
+
+> ⚠️ **重要修正**：之前"未传参会全量所有资产"的说法不准确。实际选取范围受 `assetsWithPreviews()` 基础查询的严格限制，且 `force=undefined`、`force=false`、`force=true` 三种状态在**查询层**和**业务层**的行为均有差异。
+
+---
+
+###### 1. `assetsWithPreviews()` 基础查询的过滤条件
+
+人脸检测队列和智能搜索队列共享同一个私有辅助方法 `assetsWithPreviews()` 作为基础查询：
+
+```typescript
+// asset-job.repository.ts:178-192
+private assetsWithPreviews() {
+  return this.db
+    .selectFrom('asset')
+    .where('asset.visibility', '!=', AssetVisibility.Hidden)  // 条件1：非隐藏
+    .where('asset.deletedAt', 'is', null)                      // 条件2：未删除
+    .innerJoin('asset_job_status as job_status', 'assetId', 'asset.id')  // 条件3：有元数据处理记录
+    .where((eb) =>
+      eb.exists((qb) =>
+        qb
+          .selectFrom('asset_file')
+          .whereRef('assetId', '=', 'asset.id')
+          .where('asset_file.type', '=', AssetFileType.Preview),  // 条件4：有预览图
+      ),
+    );
+}
+```
+
+**这意味着**：即使 `force` 参数未传递，也永远不会处理以下资产：
+- ❌ 隐藏资产（`visibility = Hidden`）
+- ❌ 已删除资产（`deletedAt IS NOT NULL`）
+- ❌ 没有元数据处理记录的资产（`asset_job_status` 表中无对应记录）
+- ❌ 没有预览图的资产（`asset_file` 表中无 Preview 类型记录）
+
+---
+
+###### 2. `force` 参数三态的精确差异
+
+`streamForDetectFacesJob` 使用**严格相等**判断 `force === false`，这是与其他 7 个方法最大的不同：
+
+```typescript
+// asset-job.repository.ts:440-446
+streamForDetectFacesJob(force?: boolean) {
+  return this.assetsWithPreviews()
+    .$if(force === false, (qb) => qb.where('job_status.facesRecognizedAt', 'is', null))
+    .select(['asset.id'])
+    .orderBy('asset.fileCreatedAt', 'desc')
+    .stream();
+}
+```
+
+三种状态的判断逻辑：
+
+| force 值 | `force === false` 结果 | 是否应用增量条件 | 查询范围（SQL 层） |
+|----------|----------------------|-----------------|-------------------|
+| `undefined`（未传递） | `undefined === false` → **false** | ❌ 不应用 | 基础查询结果（有 Preview 图的未删除、非隐藏资产，**无论是否已检测过人脸**） |
+| `false` | `false === false` → **true** | ✅ 应用 | 基础查询 + `facesRecognizedAt IS NULL`（有 Preview 图但**从未检测过人脸**的资产） |
+| `true` | `true === false` → **false** | ❌ 不应用 | 基础查询结果（有 Preview 图的未删除、非隐藏资产，**无论是否已检测过人脸**） |
+
+**关键结论**：
+- `force=undefined` 和 `force=true` 在 **SQL 查询层**的选取范围**完全相同**
+- 只有 `force=false` 会应用增量过滤，只处理真正未检测过的资产
+- 三种状态都不会处理隐藏、已删除、无预览图的资产
+
+---
+
+###### 3. 业务层（Service）的额外行为差异
+
+虽然 `force=undefined` 和 `force=true` 在 SQL 层的查询范围相同，但在 `handleQueueDetectFaces` 业务层的预处理和后置处理不同：
+
+```typescript
+// person.service.ts:270-297
+async handleQueueDetectFaces({ force }: JobOf<JobName.AssetDetectFacesQueueAll>): Promise<JobStatus> {
+  // 预处理阶段
+  if (force) {  // 注意：这里是 truthy 判断，force=undefined 时不执行
+    await this.personRepository.deleteFaces({ sourceType: SourceType.MachineLearning });
+    await this.handlePersonCleanup();
+    await this.personRepository.vacuum({ reindexVectors: true });
+  }
+
+  // 查询阶段
+  const assets = this.assetJobRepository.streamForDetectFacesJob(force);
+  // ... 队列作业
+
+  // 后置处理阶段
+  if (force === undefined) {  // 严格相等判断，只有未传参时执行
+    await this.jobRepository.queue({ name: JobName.PersonCleanup });
+  }
+}
+```
+
+三种状态的完整行为对比：
+
+| 维度 | `force=undefined`（未传递） | `force=false` | `force=true` |
+|------|---------------------------|---------------|-------------|
+| **预处理** | ❌ 不删除已有 ML 人脸 | ❌ 不删除已有 ML 人脸 | ✅ 删除所有 ML 人脸 → 清理 → 重建向量索引 |
+| **查询范围** | 有 Preview 图的未删除、非隐藏资产<br>（包括已检测过的） | 有 Preview 图但未检测过人脸的未删除、非隐藏资产 | 有 Preview 图的未删除、非隐藏资产<br>（包括已检测过的） |
+| **处理逻辑** | 对查询到的所有资产重新检测人脸（会覆盖已有检测结果） | 只对从未检测过的资产检测人脸 | 先清空所有 ML 人脸，再对查询到的所有资产重新检测 |
+| **后置处理** | ✅ 触发 `PersonCleanup` 作业 | ❌ 不触发 | ❌ 不触发 |
+| **实际效果** | 增量+覆盖式更新（不清空但重复检测） | 真正的增量处理（只处理新资产） | 全量重建（先清空再重新检测） |
+
+---
+
+###### 4. 与智能搜索队列（`streamForEncodeClip`）的对比
+
+人脸检测和智能搜索都使用 `assetsWithPreviews()` 作为基础查询，但 `force` 参数的判断逻辑不同：
+
+| 对比项 | `streamForDetectFacesJob` | `streamForEncodeClip` |
+|--------|---------------------------|-----------------------|
+| 基础查询 | `assetsWithPreviews()` | `assetsWithPreviews()` |
+| `$if` 条件 | `force === false`（严格相等） | `!force`（falsy 判断） |
+| `force=undefined` 行为 | 不应用增量条件，全量查询 | 应用增量条件，仅查询未处理的 |
+| `force=undefined` 与 `force=false` | 行为**不同** | 行为**相同** |
+| `force=undefined` 与 `force=true` | 查询层行为**相同**，业务层不同 | 查询层行为**不同** |
+
+---
+
+###### 5. 实际场景建议
+
+| 场景 | 推荐 force 值 | 原因 |
+|------|--------------|------|
+| 上传新资产后的日常处理 | `false` | 只处理从未检测过人脸的资产，效率最高 |
+| 检测模型升级后 | `true` | 先清空旧检测结果，用新模型全量重新检测 |
+| 部分作业失败后补漏 | `false` | 只处理失败的、从未检测过的资产 |
+| 想要重新检测所有资产但保留历史数据 | ❌ 没有直接对应参数 | `force=undefined` 会重复检测但不清空旧数据，可能产生重复人脸；<br>`force=true` 会先清空旧数据 |
+| API 请求中未传 force 参数 | `undefined` | 会全量查询并重复检测已有结果的资产，同时触发 PersonCleanup，**不推荐** |
+
+> ⚠️ **注意**：API 层 `force` 参数是 `z.boolean().optional()`，没有默认值。如果前端调用时未传递 `force` 字段，后端会收到 `undefined`，此时会进入"重复检测所有有预览图的资产"模式，这可能不是预期行为。建议在 API 调用时显式指定 `force: false` 或 `force: true`。
+
+---
+
 ##### 对重跑任务范围的影响总结
 
 | 场景 | force 参数 | 处理范围（通用描述） | 预计处理量 | 适用场景 | 不同队列的特殊注意事项 |
@@ -575,16 +707,18 @@ streamForThumbnailJob(options: { force: boolean | undefined; ... }) {
 | 部分作业失败后 | `false` | 仅未处理的资产 | 小 | 故障恢复（推荐） | - |
 | 模型升级后 | `true` | 符合通用条件的所有资产，先清空旧结果 | 大 | ML 模型版本变更 | ⚠️ 注意各队列范围差异：<br>- Sidecar 队列会处理**含已删除**的所有资产<br>- 视频转码/元数据提取会处理**含隐藏**的未删除资产 |
 | 数据损坏后 | `true` | 符合通用条件的所有资产，先清空旧结果 | 大 | 数据修复 | 同上 |
-| 功能开启后 | `false` → 逐步 `true` | 先增量，再全量 | 中→大 | 新功能上线 | ⚠️ 人脸检测队列注意：<br>`force=undefined` 会全量处理（因为使用 `force === false` 判断） |
+| 功能开启后 | `false` → 逐步 `true` | 先增量，再全量 | 中→大 | 新功能上线 | ⚠️ 人脸检测队列注意：<br>`force=undefined` 会全量查询有 Preview 图的资产（因为使用 `force === false` 判断），<br>但不会处理隐藏、已删除、无预览图的资产 |
 
 > **最佳实践**：
 > 1. 常规恢复优先使用 `force=false`，只处理未处理的资产，避免浪费资源
 > 2. 只有在模型升级、数据损坏等特殊场景下才使用 `force=true`
 > 3. `force=true` 会先删除已有结果（ML 相关队列），期间相关功能可能暂时不可用
-> 4. ⚠️ **特别注意**：
+> 4. API 调用时**建议显式指定 `force` 参数**，避免 `undefined` 导致的非预期行为
+> 5. ⚠️ **特别注意**：
 >    - `streamForSidecar` 在 `force=true` 时**包含已删除和隐藏资产**，范围最大
 >    - `streamForVideoConversion` 和 `streamForMetadataExtraction` 在 `force=true` 时**包含隐藏资产**
->    - `streamForDetectFacesJob` 使用严格相等判断，`force=undefined` 与 `force=false` 行为不同
+>    - `streamForDetectFacesJob` 使用严格相等判断，`force=undefined` 与 `force=false` 行为不同，且基础查询要求必须有 Preview 图
+>    - `streamForDetectFacesJob` 中 `force=undefined` 和 `force=true` 在 SQL 层查询范围相同，但业务层预处理行为不同
 >    - `streamForEncodeClip` 和 `streamForDetectFacesJob` 要求必须有 Preview 图，范围最严格
 
 ---
