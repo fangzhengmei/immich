@@ -193,7 +193,7 @@ async callback(dto: OAuthCallbackDto, headers: IncomingHttpHeaders, loginDetails
 
 ### 匹配优先级与合并策略
 
-**步骤 0：获取 OAuth Profile 与 oauthSid** (`auth.service.ts:308-314`)
+**步骤 0：获取 OAuth Profile 与 oauthSid** (`auth.service.ts:308-314` → `oauth.repository.ts:81-130`)
 
 ```typescript
 const url = this.resolveRedirectUri(oauth, dto.url);
@@ -201,6 +201,38 @@ const { profile, sid: oauthSid } = await this.oauthRepository.getProfileAndOAuth
   oauth, url, expectedState, codeVerifier,
 );
 ```
+
+**Profile 获取策略** (`oauth.repository.ts:93-100`)：
+```typescript
+let profile: OAuthProfile;
+const tokenClaims = tokens.claims();
+if (tokenClaims && 'email' in tokenClaims) {
+  this.logger.debug('Using ID token claims instead of userinfo endpoint');
+  profile = tokenClaims as OAuthProfile;
+} else {
+  profile = await fetchUserInfo(client, tokens.access_token, skipSubjectCheck);
+}
+```
+
+**`skipSubjectCheck` 校验边界与潜在影响**：
+
+`skipSubjectCheck` 是 `openid-client` 库的特殊标志，用于**跳过 UserInfo 响应的 `sub` 与 ID Token 的 `sub` 一致性校验**。
+
+| 校验环节 | 行为 | 代码位置 |
+|---------|------|----------|
+| ID Token `sub` 存在性 | ✅ 必须校验 (`!profile.sub` 时抛错) | `oauth.repository.ts:102-104` |
+| ID Token 与 UserInfo `sub` 一致性 | ❌ **跳过校验** (使用 `skipSubjectCheck`) | `oauth.repository.ts:99` |
+| 优先使用 ID Token Claim | ✅ 包含 email 时直接使用，不调用 UserInfo | `oauth.repository.ts:95-97` |
+
+**设计意图**：
+- 兼容某些 OAuth 提供者（如 Authelia）在 UserInfo 端点返回的 `sub` 与 ID Token 不一致的问题
+- 优先信任 ID Token 中的 Claim，减少对 UserInfo 端点的依赖
+
+**潜在风险与边界**：
+1. **ID Token 优先**：如果 ID Token 包含 `email` Claim，直接使用 ID Token，完全不调用 UserInfo 端点，`skipSubjectCheck` 不生效
+2. **UserInfo 场景**：仅当 ID Token 不含 `email` 时才调用 UserInfo，此时使用 `skipSubjectCheck`
+3. **`sub` 篡改风险**：跳过一致性校验意味着如果 UserInfo 端点返回不同的 `sub`，系统会信任 UserInfo 的值
+4. **兜底检查**：最终仍会检查 `!profile.sub` 确保 `sub` 存在，避免完全无标识
 
 - `profile.sub` - 外部用户唯一标识（后续匹配核心）
 - `profile.email` - 用于邮箱匹配
@@ -478,18 +510,37 @@ async unlink(auth: AuthDto): Promise<UserAdminResponseDto> {
 
 ```typescript
 async unlinkAll(_auth: AuthDto) {
+  // TODO replace '' with null
   await this.userRepository.updateAll({ oauthId: '' });
 }
 ```
 
-- 重置所有用户的 `oauthId` 为空字符串
+**`updateAll` 实现细节** (`user.repository.ts:194-196`)：
+```typescript
+async updateAll(dto: Updateable<UserTable>) {
+  await this.db.updateTable('user').set(dto).execute();
+}
+```
+
+| 查询/更新方法 | 是否过滤 `deletedAt IS NULL` | 代码位置 |
+|--------------|----------------------------|----------|
+| `getByOAuthId` | ✅ 是 (`.where('user.deletedAt', 'is', null)`) | `user.repository.ts:144-152` |
+| `getByEmail` | ✅ 是 (`.where('user.deletedAt', 'is', null)`) | `user.repository.ts:122-131` |
+| `update` (单个) | ✅ 是 (`.where('user.deletedAt', 'is', null)`) | `user.repository.ts:183-192` |
+| `updateAll` (批量) | ❌ **否** (无 deletedAt 过滤) | `user.repository.ts:194-196` |
+
+**关键结论**：
+- `unlinkAll` 通过 `updateAll` 执行，**没有 `deletedAt IS NULL` 过滤条件**
+- 因此会**影响包括已删除用户在内的所有用户**，软删除用户的 `oauthId` 也会被重置为空字符串
 - 用于 OAuth 配置变更、sub 迁移或提供者更换场景
-- **注意**：此操作不区分已删除用户，所有用户都会被重置
-- 重置后用户首次登录时会通过邮箱匹配自动合并
+- 重置后（未删除）用户首次登录时会通过邮箱匹配自动合并
+- 已删除用户的 `oauthId` 重置无实际业务影响，但数据库层面会被修改
 
 ---
 
 ## 两条入口对比总结
+
+### 核心功能对比
 
 | 对比项 | 入口一：OAuth 回调自动登录 | 入口二：手动链接 OAuth |
 |--------|--------------------------|----------------------|
@@ -505,6 +556,44 @@ async unlinkAll(_auth: AuthDto) {
 | 会话存储 | 自动存储 `oauthSid` | 更新当前会话的 `oauthSid` |
 | 适用场景 | 普通用户登录、首次登录合并已有账号 | 用户主动关联外部身份 |
 | 代码位置 | `auth.service.ts:292-382` | `auth.service.ts:407-435` |
+
+### `oauth.enabled` 入口拦截差异（重要排障点）
+
+**入口一：`callback()` 的拦截** (`auth.service.ts:292-296`)：
+```typescript
+async callback(dto: OAuthCallbackDto, headers: IncomingHttpHeaders, loginDetails: LoginDetails) {
+  const { oauth } = await this.getConfig({ withCache: false });
+  if (!oauth.enabled) {
+    throw new BadRequestException('OAuth is not enabled');
+  }
+  // ... 后续逻辑
+}
+```
+
+**入口二：`link()` 的拦截** (`auth.service.ts:407-418`)：
+```typescript
+async link(auth: AuthDto, dto: OAuthCallbackDto, headers: IncomingHttpHeaders): Promise<UserAdminResponseDto> {
+  const expectedState = dto.state ?? this.getCookieOauthState(headers);
+  // ... state 和 codeVerifier 验证
+  const { oauth } = await this.getConfig({ withCache: false });
+  // ⚠️ 没有检查 oauth.enabled！
+  const { profile: { sub: oauthId }, sid } = 
+    await this.oauthRepository.getProfileAndOAuthSid(oauth, dto.url, expectedState, codeVerifier);
+  // ... 后续逻辑
+}
+```
+
+| 检查项 | `callback()` | `link()` | 代码位置 |
+|--------|-------------|----------|----------|
+| `oauth.enabled` 检查时机 | **方法入口最开始** | **不检查** | `auth.service.ts:294` vs `418` |
+| 未启用时返回 | `"OAuth is not enabled"` | 无专门错误，可能在后续 OAuth 调用时失败 | - |
+| 检查顺序 | 先检查配置 → 再验证 state → 再获取 Profile | 先验证 state → 再获取配置 → 直接调用 OAuth | - |
+
+**排障含义**：
+1. **关闭 OAuth 后仍可绑定**：管理员关闭 OAuth 开关后，已登录用户仍可通过 `link()` 接口绑定 OAuth 账号
+2. **错误信息不同**：未启用 OAuth 时，`callback()` 返回明确的 "OAuth is not enabled"，而 `link()` 可能在 `getProfileAndOAuthSid` 中抛出 OAuth 库内部错误（如 discovery 失败）
+3. **状态不一致**：管理员关闭 OAuth 可能是想禁止外部登录，但 `link()` 仍允许已有用户绑定外部身份，形成配置与实际行为的不一致
+4. **排障建议**：用户报告 OAuth 绑定失败但 OAuth 已启用时，检查是 `callback` 还是 `link` 路径；`link` 路径报错需深入检查 OAuth 库的 discovery 和 token 交换日志
 
 ---
 
@@ -526,7 +615,14 @@ async unlinkAll(_auth: AuthDto) {
 
 5. **Backchannel Logout 规范遵循**：严格实现 RFC 8963，支持按 sid 和/或 sub 精确失效会话
 
-6. **移动端安全设计**：
+6. **UserInfo 校验边界**：使用 `skipSubjectCheck` 兼容部分 OAuth 提供者的 `sub` 不一致问题，但仅在 ID Token 不含 email 时生效，且最终仍校验 `sub` 存在性
+
+7. **入口拦截一致性（存在不一致）**：
+   - `callback()` 在方法入口检查 `oauth.enabled`，未启用直接拒绝
+   - `link()` 不检查 `oauth.enabled`，已登录用户可能绕过配置进行绑定
+   - 运维需注意此行为差异，必要时通过撤销 OAuth 客户端凭证彻底禁用
+
+8. **移动端安全设计**：
    - 支持客户端传入自定义 state 和 codeChallenge（PKCE）
    - 支持重定向 URI 替换，适配不同移动平台的 Deep Link 限制
    - 独立的 mobile-redirect 端点处理特殊重定向场景
@@ -594,3 +690,22 @@ A: 通过两个关键特征快速判断：
 
 **Q: 自动登录冲突为什么不返回具体原因？**
 A: 安全设计。自动登录是公开端点，任何人都可以调用，返回模糊错误可防止攻击者枚举已注册邮箱。运维需查看服务端 debug 日志才能定位具体原因。而手动绑定需要用户先登录，身份已确认，可以返回更详细的错误信息帮助用户理解问题。
+
+**Q: 关闭 OAuth 开关后为什么用户还能绑定 OAuth 账号？**
+A: 这是 `link()` 与 `callback()` 的入口拦截差异导致的行为不一致：
+- `callback()`（自动登录入口）在方法开头检查 `oauth.enabled`，未启用直接返回 `"OAuth is not enabled"`
+- `link()`（手动绑定入口）**不检查 `oauth.enabled`**，只要用户已登录且能完成 OAuth 授权码流程，就能成功绑定
+- 这可能是一个设计疏忽，如果需要彻底禁止 OAuth，建议同时撤销 OAuth 应用的客户端凭证
+
+**Q: `skipSubjectCheck` 跳过了什么校验？有什么风险？**
+A: `skipSubjectCheck` 跳过的是 **UserInfo 响应的 `sub` 与 ID Token 的 `sub` 的一致性校验**。
+- 正常流程：`fetchUserInfo(client, accessToken, expectedSub)` 会验证 UserInfo 返回的 `sub` 等于 ID Token 的 `sub`
+- 使用 `skipSubjectCheck`：不验证一致性，直接信任 UserInfo 返回的 `sub`
+- **风险边界**：仅当 ID Token 不含 `email` 时才调用 UserInfo 端点，该标志才生效；如果 ID Token 已包含 `email`，直接使用 ID Token，不存在此风险
+- **兜底保障**：最终仍会检查 `!profile.sub`，确保 `sub` 非空
+
+**Q: `unlinkAll` 会影响已删除的用户吗？**
+A: **会**。`unlinkAll` 调用 `updateAll({ oauthId: '' })`，而 `updateAll` 方法没有 `deletedAt IS NULL` 过滤条件，会更新所有用户记录（包括软删除的）。不过：
+- 已删除用户不会参与任何匹配（`getByOAuthId`/`getByEmail` 都排除已删除用户）
+- 已删除用户的 `oauthId` 被重置无实际业务影响
+- 这是一个小的设计不一致，不影响功能正确性
