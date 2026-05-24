@@ -411,7 +411,125 @@ Immich 存在两套队列运维接口，**启动队列的功能仅存在于旧�
 
 ---
 
-#### 5.4.4 按接口分组的恢复操作清单
+#### 5.4.4 `force` 参数深度解析
+
+> ⚠️ **重要修正**：之前文档中"force=true=跳过已处理"的描述是错误的。实际含义完全相反。
+
+##### `force` 参数的核心含义
+
+| 参数值 | 含义 | 处理范围 |
+|--------|------|---------|
+| `force: false`（默认） | **增量处理** | 只处理**从未处理过**的资产，跳过已有处理结果的资产 |
+| `force: true` | **全量重处理** | 处理**所有**资产，包括已处理过的；会先清空已有结果再重新处理 |
+
+---
+
+##### `force` 参数的完整传递链路
+
+```
+API 请求层
+    ↓
+PUT /api/jobs/:name { command: "start", force: boolean }
+    ↓
+Controller 层 (job.controller.ts:45-58)
+    ↓
+Service 层 (queue.service.ts:185-250)
+  start(name, { force })
+    ↓ 封装为批量作业
+  { name: JobName.AssetGenerateThumbnailsQueueAll, data: { force } }
+    ↓
+批量作业 Handler 层 (各 service.handleQueue*)
+  ├─ 预处理阶段：force=true 时先删除已有结果
+  └─ 查询阶段：streamFor*(force) → 传递给 SQL
+    ↓
+Repository 层 (asset-job.repository.ts)
+  $if(!force, (qb) => qb.where(/* 过滤已处理资产 */))
+```
+
+---
+
+##### 各队列对 `force=true` 的预处理行为
+
+当 `force=true` 时，不同队列在批量处理前会执行清空操作：
+
+| 队列 | 预处理操作（force=true 时） | 代码位置 |
+|------|----------------------------|---------|
+| **FaceDetection** 人脸检测 | 删除所有 ML 人脸 → 人员清理 → 重建向量索引 | `person.service.ts:276-279` |
+| **FacialRecognition** 人脸识别 | 取消所有 ML 人脸分配 → 人员清理 → 重建向量索引 | `person.service.ts:426-429` |
+| **SmartSearch** 智能搜索 | 删除所有 CLIP embedding → 更新模型维度 | `smart-info.service.ts:74-78` |
+| **Ocr** 文字识别 | 删除所有 OCR 记录 | `ocr.service.ts:20-22` |
+| **ThumbnailGeneration** 缩略图 | 无预处理，直接重处理所有 | `media.service.ts:70-117` |
+| **MetadataExtraction** 元数据 | 无预处理，直接重处理所有 | `metadata.service.ts:218-233` |
+| **VideoConversion** 视频转码 | 无预处理，直接重处理所有 | `media.service.ts:551-*` |
+| **DuplicateDetection** 重复检测 | 无预处理，直接重处理所有 | `duplicate.service.ts:302-325` |
+| **Sidecar** 侧记文件 | 无预处理，直接重处理所有 | `metadata.service.ts:419-437` |
+
+---
+
+##### SQL 查询层的 `force` 逻辑
+
+所有 `streamFor*` 方法都采用相同的条件构建模式：
+
+```typescript
+// asset-job.repository.ts:64-104 (缩略图示例)
+streamForThumbnailJob(options: { force: boolean | undefined; ... }) {
+  return this.db
+    .selectFrom('asset')
+    .select(['asset.id', 'asset.isEdited'])
+    .where('asset.deletedAt', 'is', null)
+    .$if(!options.force, (qb) =>
+      qb
+        .innerJoin('asset_job_status', ...)
+        .where(({ and, eb, exists, not, or, selectFrom }) => {
+          // force=false 时，只查询缺少缩略图/预览图的资产
+          const conditions = [
+            not(exists(file(AssetFileType.Thumbnail))),  // 无缩略图
+            not(exists(file(AssetFileType.Preview))),    // 无预览图
+            eb('asset.thumbhash', 'is', null),           // 无 thumbhash
+          ];
+          return or(conditions);
+        }),
+    )
+    .stream();
+}
+```
+
+**各队列的过滤条件（force=false 时）**：
+
+| 队列 | 过滤条件（只处理未处理的资产） |
+|------|-------------------------------|
+| **ThumbnailGeneration** | 缺少缩略图 / 缺少预览图 / 缺少 thumbhash / 已编辑但缺少全尺寸图 |
+| **MetadataExtraction** | `metadataExtractedAt IS NULL` |
+| **FaceDetection** | `facesRecognizedAt IS NULL` |
+| **SmartSearch** | `smart_search` 表中无记录 |
+| **DuplicateDetection** | `duplicatesDetectedAt IS NULL` |
+| **VideoConversion** | 无 `EncodedVideo` 类型的 asset_file |
+| **Ocr** | `ocrAt IS NULL` |
+| **Sidecar** | 无 `Sidecar` 类型的 asset_file |
+
+**force=true 时**：所有上述 `$if(!force, ...)` 条件被跳过，查询范围扩大到**所有未删除、非隐藏的资产**。
+
+---
+
+##### 对重跑任务范围的影响总结
+
+| 场景 | force 参数 | 处理范围 | 预计处理量 | 适用场景 |
+|------|-----------|---------|-----------|---------|
+| 初次上传后 | `false` | 仅未处理的新资产 | 小 | 日常增量处理 |
+| 夜间任务 | `false` | 仅未处理的资产 | 中 | 定时补漏 |
+| 部分作业失败后 | `false` | 仅失败的未处理资产 | 小 | 故障恢复（推荐） |
+| 模型升级后 | `true` | 所有资产，先清空旧结果 | 大 | ML 模型版本变更 |
+| 数据损坏后 | `true` | 所有资产，先清空旧结果 | 大 | 数据修复 |
+| 功能开启后 | `false` → 逐步 `true` | 先增量，再全量 | 中→大 | 新功能上线 |
+
+> **最佳实践**：
+> 1. 常规恢复优先使用 `force=false`，只处理未处理的资产，避免浪费资源
+> 2. 只有在模型升级、数据损坏等特殊场景下才使用 `force=true`
+> 3. `force=true` 会先删除已有结果，期间相关功能可能暂时不可用
+
+---
+
+#### 5.4.5 按接口分组的恢复操作清单
 
 ##### 📋 通过旧接口 `PUT /api/jobs/:name` 的恢复操作
 
@@ -422,7 +540,7 @@ curl -X PUT /api/jobs/thumbnailGeneration \
   -H "Content-Type: application/json" \
   -d '{"command": "start", "force": false}'
 
-# 强制重新生成所有缩略图（跳过已处理）
+# 强制重新生成所有缩略图（包括已处理过的）
 curl -X PUT /api/jobs/thumbnailGeneration \
   -H "Content-Type: application/json" \
   -d '{"command": "start", "force": true}'
@@ -593,7 +711,7 @@ curl -X POST /api/jobs \
 
 ---
 
-#### 5.4.6 清除失败作业（代码实现）
+#### 5.4.7 清除失败作业（代码实现）
 
 ```typescript
 // queue.service.ts:126-130
@@ -651,7 +769,7 @@ private async start(name: QueueName, { force }: QueueCommandDto): Promise<void> 
 
 ---
 
-#### 5.4.8 关键代码索引
+#### 5.4.9 关键代码索引
 
 | 文件 | 行号 | 说明 |
 |------|------|------|
@@ -660,6 +778,7 @@ private async start(name: QueueName, { force }: QueueCommandDto): Promise<void> 
 | `server/src/controllers/queue.controller.ts` | 74-84 | 新接口 `DELETE /queues/:name/jobs` - 清空队列 |
 | `server/src/services/queue.service.ts` | 102-136 | `runCommandLegacy()` - 旧接口命令分发 |
 | `server/src/services/queue.service.ts` | 185-250 | `start()` - 启动队列的核心实现 |
+| `server/src/repositories/asset-job.repository.ts` | 63-466 | `streamFor*()` 系列方法 - `force` 参数 SQL 查询逻辑 |
 | `server/src/enum.ts` | 874-884 | `QueueCommand` 枚举 - 5 种命令类型 |
 
 ### 5.5 特殊场景的重试机制
@@ -730,12 +849,45 @@ private async start(name: QueueName, { force }: QueueCommandDto): Promise<void> 
 
 ### 7.3 业务逻辑层
 
+#### 7.3.1 队列控制逻辑
+
 | 文件 | 行号 | 说明 |
 |------|------|------|
 | `server/src/services/queue.service.ts` | 102-136 | `runCommandLegacy()` - 旧接口命令分发（start/pause/resume/empty/clear-failed） |
 | `server/src/services/queue.service.ts` | 151-164 | `update()` - 新接口暂停/恢复逻辑 |
 | `server/src/services/queue.service.ts` | 170-175 | `emptyQueue()` - 新接口清空队列逻辑 |
 | `server/src/services/queue.service.ts` | 185-250 | `start()` - **启动队列的核心实现**，13 个可启动队列的 switch case |
+
+#### 7.3.2 `force` 参数处理逻辑
+
+| 文件 | 行号 | 说明 |
+|------|------|------|
+| `server/src/services/media.service.ts` | 70-117 | `handleQueueGenerateThumbnails()` - 缩略图批量处理，`force` 参数使用 |
+| `server/src/services/media.service.ts` | 80 | `streamForThumbnailJob({ force, ... })` - 缩略图查询调用 |
+| `server/src/services/smart-info.service.ts` | 68-93 | `handleQueueEncodeClip()` - 智能搜索批量处理 |
+| `server/src/services/smart-info.service.ts` | 74-78 | `force=true` 时删除所有 CLIP embeddings |
+| `server/src/services/person.service.ts` | 270-300 | `handleQueueDetectFaces()` - 人脸检测批量处理 |
+| `server/src/services/person.service.ts` | 276-279 | `force=true` 时删除所有 ML 人脸并重建索引 |
+| `server/src/services/person.service.ts` | 404-459 | `handleQueueRecognizeFaces()` - 人脸识别批量处理 |
+| `server/src/services/person.service.ts` | 426-429 | `force=true` 时取消所有 ML 人脸分配 |
+| `server/src/services/ocr.service.ts` | 14-38 | `handleQueueOcr()` - OCR 批量处理 |
+| `server/src/services/ocr.service.ts` | 20-22 | `force=true` 时删除所有 OCR 记录 |
+| `server/src/services/duplicate.service.ts` | 302-325 | `handleQueueSearchDuplicates()` - 重复检测批量处理 |
+| `server/src/services/metadata.service.ts` | 218-233 | `handleQueueMetadataExtraction()` - 元数据批量处理 |
+| `server/src/services/metadata.service.ts` | 419-437 | `handleQueueSidecar()` - Sidecar 文件批量处理 |
+
+#### 7.3.3 Repository 层 `force` 参数 SQL 逻辑
+
+| 文件 | 行号 | 说明 |
+|------|------|------|
+| `server/src/repositories/asset-job.repository.ts` | 63-104 | `streamForThumbnailJob()` - 缩略图查询，`$if(!force, ...)` 条件 |
+| `server/src/repositories/asset-job.repository.ts` | 194-208 | `streamForSearchDuplicates()` - 重复检测查询 |
+| `server/src/repositories/asset-job.repository.ts` | 210-218 | `streamForEncodeClip()` - 智能搜索查询 |
+| `server/src/repositories/asset-job.repository.ts` | 313-336 | `streamForVideoConversion()` - 视频转码查询 |
+| `server/src/repositories/asset-job.repository.ts` | 355-369 | `streamForMetadataExtraction()` - 元数据查询 |
+| `server/src/repositories/asset-job.repository.ts` | 418-437 | `streamForSidecar()` - Sidecar 文件查询 |
+| `server/src/repositories/asset-job.repository.ts` | 439-446 | `streamForDetectFacesJob()` - 人脸检测查询 |
+| `server/src/repositories/asset-job.repository.ts` | 448-461 | `streamForOcrJob()` - OCR 查询 |
 
 ### 7.4 DTO 与枚举
 
