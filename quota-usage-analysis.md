@@ -214,25 +214,43 @@ UploadAssetPreview.svelte  显示红色错误图标 + 错误文案 + 重试按�
 完整调用链：
 
 ```
-ForegroundUploadService._processAsset()
-  mobile/lib/services/foreground_upload.service.dart:350
+DriftBackupNotifier.startForegroundBackup(userId)
+  drift_backup.provider.dart:259
   ↓
-UploadRepository.uploadAsset()
-  mobile/lib/repositories/upload.repository.dart:70
+ForegroundUploadService.uploadCandidates(userId, cancelToken, callbacks)
+  foreground_upload.service.dart:77
   ↓
-POST /assets  (Dart http MultipartRequest)
+_executeWithWorkerPool(
+    processItem: (asset) => _uploadSingleAsset(asset, cancelToken, callbacks)
+  )
+  foreground_upload.service.dart:95
+  ↓
+_uploadSingleAsset(asset, cancelToken, callbacks)
+  foreground_upload.service.dart:235
+  ├─ [Live Photo] 先上传视频: _uploadRepository.uploadFile(livePhotoFile)
+  │    └─ 失败时静默忽略（不设置 shouldAbortUpload）
+  └─ [仍像] 上传主文件: _uploadRepository.uploadFile(file)
+       foreground_upload.service.dart:375
+  ↓
+UploadRepository.uploadFile(file, ...)
+  upload.repository.dart:91
+  ↓
+ProgressMultipartRequest → NetworkRepository.client.send()
   ↓
 response.statusCode != 200/201  upload.repository.dart:117
   ↓
 jsonDecode(responseBody)['message']  → "Quota has been exceeded!"
+  upload.repository.dart:126-127
   ↓
 return UploadResult.error(statusCode: 400, errorMessage: message)
   ↓
-回到 _processAsset()  foreground_upload.service.dart:391
-  ├─ 日志输出: "Error(400) uploading ... | Quota has been exceeded!"
-  ├─ callbacks.onError(asset.localId!, errorMessage)  → UI 展示
-  └─ if (result.errorMessage == "Quota has been exceeded!")  关键字符串匹配
-       └─ shouldAbortUpload = true  → 中止整个备份队列
+回到 _uploadSingleAsset()  foreground_upload.service.dart:386
+  ├─ result.isSuccess → callbacks.onSuccess
+  ├─ result.isCancelled → shouldAbortUpload = true
+  └─ result.errorMessage != null:
+       callbacks.onError(asset.localId!, errorMessage)  → UI 展示
+       if (result.errorMessage == "Quota has been exceeded!")  关键字符串匹配
+         shouldAbortUpload = true  → 中止 worker 循环
 ```
 
 **关键代码解读**：
@@ -244,7 +262,8 @@ return UploadResult.error(statusCode: 400, errorMessage: message)
     shouldAbortUpload = true;
   }
   ```
-- 匹配成功后设置 `shouldAbortUpload = true`，备份循环会在处理完当前资产后退出，不再继续上传剩余文件，避免无意义的重试。
+- 匹配成功后设置 `shouldAbortUpload = true`，`_executeWithWorkerPool` 的 worker 循环（`foreground_upload.service.dart:207`）会在处理完当前资产后检查该标志并 break，不再继续上传剩余文件。
+- `_uploadSequentially`（`foreground_upload.service.dart:117`）同样在循环开头检查 `shouldAbortUpload`，效果一致。
 - 这是**唯一一处对特定错误消息做分支逻辑**的地方——后端 `BadRequestException` 的 message 文本如果改动，会直接破坏移动端中止备份的能力。
 
 ### 5.3 多语言文案与本地化
@@ -363,14 +382,15 @@ void _handleTaskStatusUpdate(TaskStatusUpdate update) async {
 
 #### 5.5.5 与前台上传的对比
 
-| 维度 | 前台 `_processAsset` | 后台 `BackgroundUploadService` |
+| 维度 | 前台 `_uploadSingleAsset` | 后台 `BackgroundUploadService` |
 | --- | --- | --- |
 | 错误解析 | 同步检查 `UploadResult.errorMessage` ✅ | **无解析**，`TaskStatus.failed` 被忽略 ✅ |
 | 配额超限检测 | `== "Quota has been exceeded!"` ✅ | **无检测**，不读取 `responseBody` ✅ |
-| 中止机制 | `shouldAbortUpload=true` → 退出循环 ✅ | **无中止**，`shouldAbortQueuingTasks` 只在 `cancel()` 中设 true ✅ |
-| 重试行为 | 无自动重试 ✅ | `retries:3` → 最多 4 次请求 ✅ |
-| 用户可见 | `callbacks.onError` → UI 提示 ✅ | **静默**，无 UI 回调 ✅ |
-| 批量继续 | 命中超限后退出循环 ✅ | 仅单次入队 100 个，无后续循环 ✅ |
+| 中止机制 | `shouldAbortUpload=true` → worker 循环检查后 break ✅ | **无中止**，`shouldAbortQueuingTasks` 只在 `cancel()` 中设 true ✅ |
+| 重试行为 | 无自动重试，每次 `uploadFile` 调用是单次请求 ✅ | `retries:3` → 最多 4 次请求 ✅ |
+| 用户可见 | `callbacks.onError` → UI 展示错误图标 + 文案 ✅ | **静默**，无 UI 回调，无日志 ✅ |
+| 批量继续 | 命中超限后 worker 循环 break，不再处理剩余资产 ✅ | 单次入队 100 个后自然停止，无后续循环 ✅ |
+| Live Photo 处理 | 视频预传失败被静默忽略，仍尝试上传主图 ✅ | 视频上传失败则主图任务不被创建，两者均不入库 ✅ |
 
 **代码事实 ✅**：
 - `uploadBackupCandidates`（`background_upload.service.dart:171-185`）只取前 100 个候选资产入队一次，没有 `while` 循环。一批处理完（无论成功失败）后不会自动拉取下一批。
@@ -394,6 +414,93 @@ iOS 后台备份通过原生 `BackgroundWorker` 触发，而非 App 内调度：
 - 系统调度：iOS 根据设备空闲、充电、网络等条件决定何时触发后台任务
 
 这意味着用户**无法在 App 内实时看到后台上传的配额超限错误**——错误只存在于服务器日志和客户端 `background_downloader` 的本地数据库中，不进入 UI。
+
+### 5.7 Live Photo 视频预传失败对配额判断的影响
+
+iOS Live Photo 由一张静态图（HEIC/JPEG）和一段短视频（MOV/MP4）组成。前台 `_uploadSingleAsset` 和后台 `BackgroundUploadService` 对 Live Photo 采用了不同的上传策略，两者在视频预传失败时的行为差异会直接影响配额判断的准确性。
+
+#### 5.7.1 前台 `_uploadSingleAsset` 的 Live Photo 流程
+
+`foreground_upload.service.dart:332-356`：
+
+```dart
+// Upload live photo video first if available
+String? livePhotoVideoId;
+if (entity.isLivePhoto && livePhotoFile != null) {
+  final livePhotoResult = await _uploadRepository.uploadFile(
+    file: livePhotoFile, ...
+  );
+
+  if (livePhotoResult.isSuccess && livePhotoResult.remoteAssetId != null) {
+    livePhotoVideoId = livePhotoResult.remoteAssetId;
+  }
+  // ⚠️ livePhotoResult.isSuccess == false 时，静默忽略，不设 shouldAbortUpload
+  // ⚠️ livePhotoResult.errorMessage == "Quota has been exceeded!" 时，也不处理
+}
+
+if (livePhotoVideoId != null) {
+  fields['livePhotoVideoId'] = livePhotoVideoId;
+}
+
+// Upload still image (always executed, regardless of video result)
+final result = await _uploadRepository.uploadFile(file: file, ...);
+```
+
+**代码事实 ✅**：
+1. 视频预传失败时，代码仅将 `livePhotoVideoId` 保持为 `null`，不调用 `callbacks.onError`，不设置 `shouldAbortUpload`。
+2. 主图上传始终会执行，即使视频因配额超限失败。
+3. 主图上传失败并返回 `"Quota has been exceeded!"` 时，才触发 `shouldAbortUpload = true`（`foreground_upload.service.dart:399`）。
+4. 视频预传的 `errorMessage` 从未被检查——如果视频上传因配额超限失败而主图成功，用户不会收到任何配额超限提示。
+
+**风险分析**：
+
+| 场景 | 视频预传 | 主图上传 | `shouldAbortUpload` | 用户感知 |
+| --- | --- | --- | --- | --- |
+| 配额刚满 | 失败（400） | 成功 | ❌ 不设置 | 静默：Live Photo 降级为静态图 |
+| 配额已满 | 失败（400） | 失败（400） | ✅ 设置 | 主图失败提示触发中止 |
+| 配额已满 | 失败（400） | 成功（极小概率） | ❌ 不设置 | 静默：视频丢失但主图入库 |
+| 配额充足 | 成功 | 成功 | — | 正常上传 |
+
+**最关键的风险**：视频预传因配额超限失败后，如果主图上传恰好成功（比如配额刚好够主图但不够视频，或缓存值滞后），该 Live Photo 会被"静默降级"为只有静态图的资产，用户不会收到任何提示。
+
+#### 5.7.2 后台 `BackgroundUploadService` 的 Live Photo 流程
+
+`background_upload.service.dart:228-259` 的 `_handleLivePhoto`：
+
+```dart
+Future<void> _handleLivePhoto(TaskStatusUpdate update) async {
+  try {
+    if (update.responseBody == null || update.responseBody!.isEmpty) {
+      return;  // 视频上传失败时 responseBody 可能为空，直接返回
+    }
+    final response = jsonDecode(update.responseBody!);
+    // 解析 response['id'] → livePhotoVideoId
+    // 构建 getLivePhotoUploadTask → enqueueTasks([uploadTask])
+  } catch (error, stackTrace) {
+    // 失败时仅 dPrint，不做任何错误上报
+  }
+}
+```
+
+**代码事实 ✅**：
+1. 后台 Live Photo 是两段式：先入队视频任务，视频任务成功后在 `_handleLivePhoto` 中解析 `responseBody` 获取 `id`，再构建主图任务并入队。
+2. 如果视频任务失败（`TaskStatus.failed`），`_handleTaskStatusUpdate` 的 `default` 分支直接忽略，`_handleLivePhoto` 永远不会被调用，主图任务也不会被创建。
+3. 整个过程无错误回调、无 UI 提示、无日志（`catch` 用的是 `dPrint` 而非 `_logger`）。
+
+**与前台的对比**：
+
+| 维度 | 前台 `_uploadSingleAsset` | 后台 `BackgroundUploadService` |
+| --- | --- | --- |
+| 视频失败后主图 | 仍尝试上传 | 不创建主图任务，两者均丢失 |
+| 视频失败的配额判断 | 依赖主图上传结果 | 不做任何配额判断 |
+| 视频失败的用户提示 | 依赖主图上传失败才触发 | 完全静默 |
+| 降级行为 | 降级为静态图（静默） | 整个 Live Photo 丢失（静默） |
+
+#### 5.7.3 结论
+
+1. **前台**：Live Photo 视频预传失败不会触发配额中止，仅当主图上传也失败时才中止。存在"视频静默丢失但主图成功入库"的降级风险。
+2. **后台**：Live Photo 视频上传失败导致整个 Live Photo（视频+主图）静默丢失，无任何配额判断和用户提示。
+3. **两者均缺失**对视频预传阶段的错误检查——`livePhotoResult.errorMessage` 和 `update.responseBody` 在失败路径上从未被用于判断配额状态。
 
 ## 6. 缓存对齐机制
 
@@ -447,7 +554,7 @@ if (config.nightlyTasks.syncQuotaUsage) {
                        │             │                   │             │
                        │             ▼                   ▼             │
                        │       前台同步上传       iOS 后台 URLSession    │
-                       │       (_processAsset)    (BackgroundUpload)   │
+                       │  (_uploadSingleAsset)  (BackgroundUpload)  │
                        │             │                   │             │
                        └─────────────┼───────────────────┼─────────────┘
                                      │                   │
@@ -520,7 +627,7 @@ if (config.nightlyTasks.syncQuotaUsage) {
 
 ## 8. 设计注意事项与隐式约束
 
-1. **硬编码字符串耦合**：移动端 `foreground_upload.service.dart:399` 用 `== "Quota has been exceeded!"` 做分支判断。后端如果修改这个异常消息文本，移动端将无法识别配额超限，导致备份队列不会中止，产生大量无意义的 400 请求。
+1. **硬编码字符串耦合**（代码事实 ✅）：移动端 `foreground_upload.service.dart:399` 用 `== "Quota has been exceeded!"` 做分支判断。后端如果修改这个异常消息文本，移动端将无法识别配额超限，备份队列不会中止，产生大量无意义的 400 请求。此耦合仅存在于前台路径，后台路径因无错误处理不受影响。
 
 2. **无 i18n 的错误提示**：超限提示是英文硬编码，所有语言的用户看到的都是 `"Quota has been exceeded!"`，Web 端还会附加 `(Immich Server Error)` 后缀。
 
@@ -542,6 +649,12 @@ if (config.nightlyTasks.syncQuotaUsage) {
    - 后台上传（iOS URLSession）不做任何检测，单次入队 100 个后自然停止。
    - 两者的错误可见性差异：前台通过 `callbacks.onError` 提示用户，后台完全静默。
 
+8. **Live Photo 视频预传的静默降级**（代码事实 ✅）：
+   - 前台 `_uploadSingleAsset`（`foreground_upload.service.dart:332-352`）中，Live Photo 视频预传失败（包括配额超限）被静默忽略，不设置 `shouldAbortUpload`，不调用 `callbacks.onError`。
+   - 主图上传始终会执行，可能出现"视频丢失但主图成功入库"的静默降级场景。
+   - 后台 `_handleLivePhoto`（`background_upload.service.dart:228-259`）中，视频上传失败导致主图任务不被创建，整个 Live Photo 静默丢失。
+   - 两者均未在视频预传阶段检查 `errorMessage` 或 `responseBody` 中的配额信息。
+
 ## 9. 关键代码索引
 
 | 主题 | 文件 | 行号 |
@@ -562,15 +675,24 @@ if (config.nightlyTasks.syncQuotaUsage) {
 | Web 端错误处理 | `web/src/lib/utils/handle-error.ts` | 4, 38 |
 | Web 端上传错误捕获 | `web/src/lib/utils/file-uploader.ts` | 255, 262 |
 | 前台上传配额检测 | `mobile/lib/services/foreground_upload.service.dart` | 399 |
-| 前台上传中止循环 | `mobile/lib/services/foreground_upload.service.dart` | 207 |
-| 后台上传服务入口 | `mobile/lib/services/background_upload.service.dart` | 159, 207 |
+| 前台上传中止循环（worker pool） | `mobile/lib/services/foreground_upload.service.dart` | 207 |
+| 前台上传主路径 `_uploadSingleAsset` | `mobile/lib/services/foreground_upload.service.dart` | 235 |
+| 前台 Live Photo 视频预传 | `mobile/lib/services/foreground_upload.service.dart` | 332-352 |
+| 前台上传入口 `uploadCandidates` | `mobile/lib/services/foreground_upload.service.dart` | 77 |
+| 前台 worker pool `_executeWithWorkerPool` | `mobile/lib/services/foreground_upload.service.dart` | 193 |
+| 前台顺序上传 `_uploadSequentially` | `mobile/lib/services/foreground_upload.service.dart` | 108 |
+| 后台上传服务入口 `uploadBackupCandidates` | `mobile/lib/services/background_upload.service.dart` | 159 |
 | 后台上传错误处理（缺失） | `mobile/lib/services/background_upload.service.dart` | 207-226 |
 | 后台上传任务构建 | `mobile/lib/services/background_upload.service.dart` | 372, 435 |
-| 后台上传 Repository | `mobile/lib/repositories/upload.repository.dart` | 40, 91 |
-| 前台上传 Repository | `mobile/lib/repositories/upload.repository.dart` | 91 |
+| 后台 Live Photo 处理 `_handleLivePhoto` | `mobile/lib/services/background_upload.service.dart` | 228-259 |
+| 后台上传 Repository `uploadFile` | `mobile/lib/repositories/upload.repository.dart` | 91 |
+| 前台上传 Repository `uploadFile` | `mobile/lib/repositories/upload.repository.dart` | 91 |
+| Repository 错误解析 | `mobile/lib/repositories/upload.repository.dart` | 117, 126-127 |
+| 前台备份触发入口 | `mobile/lib/providers/backup/drift_backup.provider.dart` | 259 |
+| 后台备份触发入口 | `mobile/lib/providers/backup/drift_backup.provider.dart` | 376 |
+| 前台备份错误回调 UI | `mobile/lib/providers/backup/drift_backup.provider.dart` | 345 |
 | 移动端配额进度展示 | `mobile/lib/widgets/common/app_bar_dialog/app_bar_dialog.dart` | 147 |
 | SDK HttpError 类型 | `packages/sdk/src/fetch-errors.ts` | 16, 20 |
-| 后台备份入口 | `mobile/lib/providers/backup/drift_backup.provider.dart` | 376 |
 | iOS 后台 Worker（Swift） | `mobile/ios/Runner/Background/BackgroundWorker.swift` | — |
 | Pigeon 桥接 | `mobile/pigeon/background_worker_api.dart` | 44 |
 
