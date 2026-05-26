@@ -126,23 +126,162 @@ private requireQuota(auth: AuthDto, size: number) {
 - `auth.user.quotaUsageInBytes` 来自 `session.repository` / `api.key.repository` / `shared.link.repository` 里 `authUser` 投影在**请求开始时**从 `user` 表读到的缓存值。
 - 因此这是**乐观检查**：在请求开始到 `updateUsage` 落库之间若有其他请求同时上传，理论上会出现竞态（两个请求都看到相同的 `quotaUsageInBytes`，都通过校验，都成功），最终缓存值会短暂大于上限，但下次 `syncUsage` 会把缓存拉回到真实值，后续上传将被拒。Immich 选择接受这种短暂越界，以避免在每次上传里加数据库事务。
 
-### 4.2 "提示"以什么形式下发
+### 4.2 错误响应结构
 
-Immich 没有独立的"配额告警"事件/邮件/websocket 推送；所谓的"上限提示"就是上传接口抛出的 HTTP 400：
+`BadRequestException('Quota has been exceeded!')` 会被全局异常过滤器捕获并标准化：
+
+`server/src/middleware/global-exception.filter.ts:30` 的 `fromError()`：
+
+```ts
+if (error instanceof HttpException) {
+  const status = error.getStatus();           // 400
+  const response = error.getResponse();       // 'Quota has been exceeded!'
+  const body = typeof response === 'string'
+    ? { message: response }
+    : { ...response };
+  delete body['error'];
+  delete body['statusCode'];
+  return { status, body };
+}
+```
+
+最终发往客户端的 HTTP 响应为：
 
 ```
-BadRequestException('Quota has been exceeded!')
+HTTP/1.1 400 Bad Request
+x-immich-correlation-id: <uuid>
+Content-Type: application/json
+
+{ "message": "Quota has been exceeded!" }
 ```
 
-客户端（web / 移动）按通用错误提示向用户呈现。代码里没有 `NotificationService` 监听 `AssetCreate` / `UserSyncUsage` 来发送配额邮件或推送，`NotificationService` 的 `onAssetTrash` / `onAssetDelete` 等 handler 也不涉及配额（`server/src/services/notification.service.ts:151` 起）。
+### 4.3 "提示"以什么形式下发
+
+Immich 没有独立的"配额告警"事件/邮件/websocket 推送；所谓的"上限提示"就是上传接口抛出的 HTTP 400。代码里没有 `NotificationService` 监听 `AssetCreate` / `UserSyncUsage` 来发送配额邮件或推送，`NotificationService` 的 `onAssetTrash` / `onAssetDelete` 等 handler 也不涉及配额（`server/src/services/notification.service.ts:151` 起）。
 
 因此"告警下发"的边界应理解为：**同步阻塞上传并返回 400**，没有异步通知通道。
 
-## 5. 缓存对齐机制
+## 5. 配额超限提示的端到端链路
+
+从后端抛异常到用户看到提示，Web 端和移动端走了两条不同的路径。
+
+### 5.1 Web 端（SvelteKit）处理流程
+
+**触发条件**：用户在网页端拖拽或选择文件上传，且 `quotaUsageInBytes + file.size > quotaSizeInBytes`。
+
+完整调用链：
+
+```
+用户选择文件
+  ↓
+fileUploadHandler()  web/src/lib/utils/file-uploader.ts:80
+  ↓
+uploadRequest<AssetMediaResponseDto>()  POST /assets
+  ↓
+SDK 抛出 HttpError  @oazapfts/runtime
+  ↓
+catch (error) { ... }  file-uploader.ts:255
+  ↓
+handleError(error, $t('errors.unable_to_upload_file'))
+  web/src/lib/utils/handle-error.ts:38
+    ├─ getServerErrorMessage(error)  handle-error.ts:4
+    │   ├─ isHttpError(error)  packages/sdk/src/fetch-errors.ts:20
+    │   ├─ data = JSON.parse(error.data)
+    │   └─ return data.message  → "Quota has been exceeded!"
+    ├─ 截断前 75 字符 + 后缀 "(Immich Server Error)"
+    └─ toastManager.danger(errorMessage)  显示红色 toast
+  ↓
+uploadAssetsStore.updateItem(id, { state: UploadState.ERROR, error: errorMessage })
+  ↓
+UploadAssetPreview.svelte  显示红色错误图标 + 错误文案 + 重试按钮
+```
+
+**关键代码解读**：
+
+- `handle-error.ts:48` 的 `getServerErrorMessage()` 优先取 `error.data.message`，这正是后端返回的 `"Quota has been exceeded!"`。
+- `handle-error.ts:50` 做了长度截断并标注 `(Immich Server Error)`，最终 toast 显示：
+  ```
+  Quota has been exceeded!
+  (Immich Server Error)
+  ```
+- `file-uploader.ts:262` 把错误消息同时写入上传状态，用户在上传面板里可以看到每个失败文件的错误原因。
+- Web 端**不做字符串匹配**，配额超限错误和其他上传错误（如网络错误、文件格式错误）走同一套展示逻辑。
+
+### 5.2 移动端（Flutter）处理流程
+
+**触发条件**：App 开启自动备份，后台或前台上传时遇到配额超限。移动端有特殊的逻辑来识别配额超限并中止整个备份队列。
+
+完整调用链：
+
+```
+ForegroundUploadService._processAsset()
+  mobile/lib/services/foreground_upload.service.dart:350
+  ↓
+UploadRepository.uploadAsset()
+  mobile/lib/repositories/upload.repository.dart:70
+  ↓
+POST /assets  (Dart http MultipartRequest)
+  ↓
+response.statusCode != 200/201  upload.repository.dart:117
+  ↓
+jsonDecode(responseBody)['message']  → "Quota has been exceeded!"
+  ↓
+return UploadResult.error(statusCode: 400, errorMessage: message)
+  ↓
+回到 _processAsset()  foreground_upload.service.dart:391
+  ├─ 日志输出: "Error(400) uploading ... | Quota has been exceeded!"
+  ├─ callbacks.onError(asset.localId!, errorMessage)  → UI 展示
+  └─ if (result.errorMessage == "Quota has been exceeded!")  关键字符串匹配
+       └─ shouldAbortUpload = true  → 中止整个备份队列
+```
+
+**关键代码解读**：
+
+- `upload.repository.dart:126` 解析响应体时用 `error['message'] ?? error['error']` 提取错误信息。
+- `foreground_upload.service.dart:399` 对配额超限做了**硬编码字符串匹配**：
+  ```dart
+  if (result.errorMessage == "Quota has been exceeded!") {
+    shouldAbortUpload = true;
+  }
+  ```
+- 匹配成功后设置 `shouldAbortUpload = true`，备份循环会在处理完当前资产后退出，不再继续上传剩余文件，避免无意义的重试。
+- 这是**唯一一处对特定错误消息做分支逻辑**的地方——后端 `BadRequestException` 的 message 文本如果改动，会直接破坏移动端中止备份的能力。
+
+### 5.3 多语言文案与本地化
+
+Immich 的 i18n 文件（`i18n/*.json`）中**没有独立的 key 对应配额超限错误**。相关的文案只有：
+
+| key | 说明 |
+| --- | --- |
+| `storage_quota` | 设置页面的"存储配额"标签 |
+| `has_quota` | 用户列表中的"配额大小"列标题 |
+| `quota_size_gib` | 管理员编辑用户时的"配额大小（GiB）"字段 |
+| `quota_higher_than_disk_size` | 管理员设置配额大于磁盘容量时的提示 |
+| `nightly_tasks_sync_quota_usage_setting` | 夜间任务开关标签 |
+
+真正的超限提示 `"Quota has been exceeded!"` 是后端硬编码的英文字符串，直接透传给客户端显示，不经过 i18n 翻译。Web 端会原样显示（附 `(Immich Server Error)` 后缀），移动端也原样显示并做字符串匹配。
+
+### 5.4 移动端配额使用量展示
+
+移动端在侧边栏（App Bar Dialog）实时展示配额进度，数据来源是 `AuthUser` entity 中的 `quotaSizeInBytes` 和 `quotaUsageInBytes`：
+
+`mobile/lib/widgets/common/app_bar_dialog/app_bar_dialog.dart:147`
+
+```dart
+if (user != null && user.hasQuota) {
+  usedDiskSpace = formatBytes(user.quotaUsageInBytes);
+  totalDiskSpace = formatBytes(user.quotaSizeInBytes);
+  percentage = user.quotaUsageInBytes / user.quotaSizeInBytes;
+}
+```
+
+用 `LinearProgressIndicator` 展示进度条，下方显示 `X used of Y`。这是**被动展示**，进度条不会在即将超限时变红或弹出警告——只有真正发起上传被 400 拒绝时用户才会收到提示。
+
+## 6. 缓存对齐机制
 
 `quotaUsageInBytes` 是缓存，真实口径在 `asset_exif.fileSizeInByte`。对齐手段有两类：
 
-### 5.1 主动全量 / 单用户重算
+### 6.1 主动全量 / 单用户重算
 
 - `UserRepository.syncUsage(id?)`（`server/src/repositories/user.repository.ts:310`）：
   - 传 `id` 时只重算该用户；
@@ -150,7 +289,7 @@ BadRequestException('Quota has been exceeded!')
 - `UserAdminService.update`（`user-admin.service.ts:61`）：管理员改配额时对该用户重算一次。
 - `UserService.handleUserSyncUsage`（`server/src/services/user.service.ts:233`）：处理 `JobName.UserSyncUsage` 任务，全量重算。
 
-### 5.2 定时触发
+### 6.2 定时触发
 
 `server/src/services/queue.service.ts:280` 的 `handleNightlyJobs`：
 
@@ -174,28 +313,60 @@ if (config.nightlyTasks.syncQuotaUsage) {
 
 `server/src/repositories/user.repository.ts:232` 的 `getUserStats()` 直接 `SUM(asset_exif.fileSizeInByte)`（`asset.libraryId IS NULL`），并拆出 `usagePhotos` / `usageVideos`。`ServerService.getStatistics`（`server/src/services/server.service.ts:133`）把这个结果填到 `UsageByUserDto`，但 `quotaSizeInBytes` 直接取 `user.quotaSizeInBytes`——也就是说**展示层的"已用"是实时聚合计，"配额"是 user 表值**，两者的口径并不完全同步，这在夜间 `syncUsage` 之前会有差异。
 
-## 7. 小结：一张链路图
+## 7. 完整端到端链路全景图
 
 ```
-                ┌──────────────────────┐
-                │   POST /assets      │  (AssetMediaController)
-                └─────────┬────────────┘
-                          │
-                          ▼
-                ┌──────────────────────┐
-                │ AssetMediaService    │
-                │  .uploadAsset        │
-                └──┬───────────┬───────┘
-                   │           │
-     ① requireQuota            ④ updateUsage(+size)
-     （用 auth.user 的          （原子 SQL 累加
-      缓存字段判断）             user.quotaUsageInBytes）
-                   │
-                   ▼
-        ②③ create() 写 asset + asset_exif.fileSizeInByte
-                   │
-                   ▼
-        文件落盘 + JobName.AssetExtractMetadata
+                                   ┌─────────────────────────┐
+                                   │  用户上传文件（Web/APP） │
+                                   └───────────┬─────────────┘
+                                               │
+                       ┌───────────────────────┼───────────────────────┐
+                       │                       │                       │
+                       ▼                       ▼                       ▼
+              Web 拖拽上传             移动端备份任务          移动端手动上传
+                       │                       │                       │
+                       └───────────────────────┼───────────────────────┘
+                                               │
+                                               ▼
+                                   ┌─────────────────────────┐
+                                   │  POST /assets  (HTTP)    │
+                                   └───────────┬─────────────┘
+                                               │
+  ┌────────────────────────────────────────────┼────────────────────────────────────────────┐
+  │ SERVER                                     │                                            │
+  │                                            ▼                                            │
+  │                          ┌──────────────────────────────────┐                           │
+  │                          │ AssetMediaService.uploadAsset    │                           │
+  │                          │  ① requireQuota(auth, file.size) │                           │
+  │                          │    quotaUsage + size > quotaSize │                           │
+  │                          │    throw BadRequestException     │                           │
+  │                          └───────────────┬──────────────────┘                           │
+  │                                          │                                              │
+  │                                          ▼                                              │
+  │                          ┌──────────────────────────────────┐                           │
+  │                          │ GlobalExceptionFilter.fromError  │                           │
+  │                          │  status=400                      │                           │
+  │                          │  body={ message: "Quota has      │                           │
+  │                          │          been exceeded!" }        │                           │
+  │                          └───────────────┬──────────────────┘                           │
+  │                                          │                                              │
+  └──────────────────────────────────────────┼──────────────────────────────────────────────┘
+                                             │
+                                             ▼
+                                   HTTP 400 JSON Response
+                                             │
+                       ┌─────────────────────┼─────────────────────┐
+                       │                     │                     │
+                       ▼                     ▼                     ▼
+                Web 端处理             移动端处理             SDK HttpError
+                       │                     │                     │
+  ┌──────────────────────────┐  ┌──────────────────────────┐
+  │ handleError()            │  │ 错误消息字符串匹配        │
+  │ getServerErrorMessage()  │  │ "Quota has been exceeded!"│
+  │ toastManager.danger()    │  │ shouldAbortUpload = true │
+  │ uploadAssetsStore ERROR  │  │ 中止整个备份队列         │
+  │ 显示红色 toast + 重试按钮 │  │ UI 展示错误信息         │
+  └──────────────────────────┘  └──────────────────────────┘
 ```
 
 删除方向的对称链路：
@@ -223,13 +394,26 @@ if (config.nightlyTasks.syncQuotaUsage) {
                               以 asset_exif SUM 回写 user.quotaUsageInBytes
 ```
 
-## 8. 关键代码索引
+## 8. 设计注意事项与隐式约束
+
+1. **硬编码字符串耦合**：移动端 `foreground_upload.service.dart:399` 用 `== "Quota has been exceeded!"` 做分支判断。后端如果修改这个异常消息文本，移动端将无法识别配额超限，导致备份队列不会中止，产生大量无意义的 400 请求。
+
+2. **无 i18n 的错误提示**：超限提示是英文硬编码，所有语言的用户看到的都是 `"Quota has been exceeded!"`，Web 端还会附加 `(Immich Server Error)` 后缀。
+
+3. **乐观校验的短暂越界**：并发上传时多个请求可能同时通过校验，导致 `quotaUsageInBytes` 短暂超过上限，但夜间 `syncUsage` 会纠正，后续上传将被拒。
+
+4. **移动端被动展示**：侧边栏进度条只做展示，不做阈值告警（如 90% 时变色、弹通知）。
+
+5. **外部库资产不计入**：`libraryId IS NOT NULL` 的资产（外部挂载）不占用配额，上传、删除时都不触发 `updateUsage`。
+
+## 9. 关键代码索引
 
 | 主题 | 文件 | 行号 |
 | --- | --- | --- |
 | 配额字段定义 | `server/src/schema/tables/user.table.ts` | 72, 75 |
 | 鉴权上下文携带配额 | `server/src/database.ts` | 342 |
 | 上传入口 & 校验 | `server/src/services/asset-media.service.ts` | 127, 141, 155, 366 |
+| 全局异常过滤器 | `server/src/middleware/global-exception.filter.ts` | 30 |
 | 运动视频累加 | `server/src/services/metadata.service.ts` | 729, 750 |
 | 删除时扣减 | `server/src/services/asset.service.ts` | 307, 334 |
 | 原子累加 SQL | `server/src/repositories/user.repository.ts` | 300 |
@@ -239,3 +423,10 @@ if (config.nightlyTasks.syncQuotaUsage) {
 | 夜间任务派发 | `server/src/services/queue.service.ts` | 280 |
 | 管理端用量聚合 | `server/src/repositories/user.repository.ts` | 232 |
 | OAuth 配额注入 | `server/src/services/auth.service.ts` | 371 |
+| Web 端错误处理 | `web/src/lib/utils/handle-error.ts` | 4, 38 |
+| Web 端上传错误捕获 | `web/src/lib/utils/file-uploader.ts` | 255, 262 |
+| 移动端上传 Repository | `mobile/lib/repositories/upload.repository.dart` | 117, 126 |
+| 移动端配额字符串匹配 | `mobile/lib/services/foreground_upload.service.dart` | 399 |
+| 移动端配额进度展示 | `mobile/lib/widgets/common/app_bar_dialog/app_bar_dialog.dart` | 147 |
+| SDK HttpError 类型 | `packages/sdk/src/fetch-errors.ts` | 16, 20 |
+
