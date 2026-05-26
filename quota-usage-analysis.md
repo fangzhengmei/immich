@@ -279,31 +279,55 @@ if (user != null && user.hasQuota) {
 
 ### 5.5 iOS 后台 URLSession 上传的配额超限处理（关键差异）
 
-iOS 后台备份使用 `background_downloader` 包（基于 `URLSession`）进行异步上传，与前台上传的错误处理路径有本质区别。
+iOS 后台备份使用 `background_downloader: ^9.5.4`（`mobile/pubspec.yaml:14`），基于 iOS 原生 `URLSession` 进行异步上传，与前台上传的错误处理路径有本质区别。本节所有结论均明确标注**证据等级**：
 
-**后台上传链路**：
+| 证据等级 | 说明 |
+| --- | --- |
+| ✅ **代码事实** | 项目源码中直接可验证 |
+| 📚 **SDK 文档事实** | `background_downloader` 9.5.4 官方 API 契约 |
+| ⚠️ **合理推断** | 基于 SDK 行为惯例和现有代码逻辑推断 |
+
+#### 5.5.1 事件流与消费链路
 
 ```
-DriftBackupNotifier.startBackupWithURLSession()
-  drift_backup.provider.dart:376
-  ↓
-BackgroundUploadService.uploadBackupCandidates(userId)
-  background_upload.service.dart:159
-  ↓
-  取前 100 个候选资产
-  构建 UploadTask（retries: 3）
-  enqueueTasks(tasks)  →  FileDownloader().enqueueAll()
-  ↓
-URLSession 后台上传（App 可挂起）
-  ↓
-TaskStatusUpdate 回调  →  _onUploadCallback()  background_upload.service.dart:133
-  ↓
-_handleTaskStatusUpdate(update)  background_upload.service.dart:207
-  ├─ TaskStatus.complete  →  处理 Live Photo 后续上传 + iOS 临时文件清理
-  └─ default              →  break （无任何处理！）
+FileDownloader() 原生回调
+  ↓  （upload.repository.dart:23-37）
+UploadRepository.onUploadStatus 回调
+  ↓  （background_upload.service.dart:108）
+BackgroundUploadService._onUploadCallback(update)
+  ├─ 向 taskStatusController.add(update) （broadcast stream）
+  └─ _handleTaskStatusUpdate(update)  ← 唯一的业务处理入口
 ```
 
-**`_handleTaskStatusUpdate` 的关键代码**（`background_upload.service.dart:207-226`）：
+**代码事实 ✅**：
+- `background_upload.service.dart:108` 在构造函数中绑定回调：`_uploadRepository.onUploadStatus = _onUploadCallback`
+- `background_upload.service.dart:122` 暴露 `taskStatusStream` 是 `broadcast()` Stream，但**整个代码库中没有任何地方 `.listen()` 它**：
+  ```bash
+  $ grep -n "taskStatusStream\.listen\|listen.*taskStatus" mobile/lib -r
+  # 无结果
+  ```
+- 所有业务逻辑仅存在于 `_handleTaskStatusUpdate(update)`（`background_upload.service.dart:207`），且**不返回 Future**（`void` 返回类型 + 内部 `unawaited`），调用方无法 await。
+- `_taskStatusController` 是 `broadcast()`，没有消费者订阅时事件被丢弃（Dart Stream 语义）。
+
+#### 5.5.2 `TaskStatusUpdate.responseBody` 的可用性
+
+**代码事实 ✅**：
+- `_handleLivePhoto`（`background_upload.service.dart:239`）直接读取 `update.responseBody` 解析 JSON 中的 `response['id']`：
+  ```dart
+  if (update.responseBody == null || update.responseBody!.isEmpty) {
+    return;
+  }
+  final response = jsonDecode(update.responseBody!);
+  ```
+- 这表明 `background_downloader` 9.5.4 在 **`TaskStatus.complete` 状态下**会填充 `responseBody`。
+
+**⚠️ 合理推断（非代码事实）**：
+- `background_downloader` 的 API 设计中，`responseBody` 字段在 `TaskStatus.failed` 状态下同样可用（SDK 文档对 `TaskStatusUpdate` 的描述）。但 Immich 代码从未读取这个状态下的 `responseBody`，因此**此结论属于推断**，不是已验证的代码行为。
+
+#### 5.5.3 `_handleTaskStatusUpdate` 的失败分支处理
+
+**代码事实 ✅**：
+`background_upload.service.dart:207-226` 的 switch 结构：
 
 ```dart
 void _handleTaskStatusUpdate(TaskStatusUpdate update) async {
@@ -325,23 +349,41 @@ void _handleTaskStatusUpdate(TaskStatusUpdate update) async {
 }
 ```
 
-**与前台上传的对比**：
+`TaskStatus.failed`、`TaskStatus.waitingToRetry`、`TaskStatus.canceled`、`TaskStatus.paused` 全部进入 `default` 分支，静默忽略。
 
-| 维度 | 前台上传 | 后台上传（URLSession） |
+#### 5.5.4 重试次数与行为
+
+**代码事实 ✅**：
+- `buildUploadTask`（`background_upload.service.dart:435`）中 `retries: 3` 是硬编码的。
+- `background_downloader` 的重试语义：`retries` 指**额外重试次数**，即总尝试次数 = 1（原始）+ `retries`。因此每个任务最多 4 次 HTTP 请求。
+- `updates: Updates.statusAndProgress`（`background_upload.service.dart:434`）意味着每次状态变更（包括每次重试失败）都会触发回调。
+
+**⚠️ 合理推断**：
+- 配额超限是确定性 400 错误，服务器每次都会返回相同的错误。因此配额超限时，每个资产会产生 4 次 400 请求。
+
+#### 5.5.5 与前台上传的对比
+
+| 维度 | 前台 `_processAsset` | 后台 `BackgroundUploadService` |
 | --- | --- | --- |
-| 错误解析 | 同步检查 `UploadResult.errorMessage` | **无解析**，`TaskStatus.failed` 被忽略 |
-| 配额超限检测 | `result.errorMessage == "Quota has been exceeded!"` | **无检测**，不读取 `responseBody` |
-| 中止机制 | `shouldAbortUpload = true` → 退出 worker 循环 | **无中止**，`shouldAbortQueuingTasks` 只在 `cancel()` 中设为 true |
-| 重试行为 | 无自动重试，由上层 `_executeWithWorkerPool` 控制 | `retries: 3`（`background_upload.service.dart:435`），自动重试 3 次 |
-| 错误对用户可见 | `callbacks.onError` 回调 → UI 提示 | **无回调**，`TaskStatus.failed` 被静默忽略 |
-| 批量继续 | 命中超限后退出循环，不再上传剩余资产 | 继续上传下一批 100 个候选资产，无上限检查 |
+| 错误解析 | 同步检查 `UploadResult.errorMessage` ✅ | **无解析**，`TaskStatus.failed` 被忽略 ✅ |
+| 配额超限检测 | `== "Quota has been exceeded!"` ✅ | **无检测**，不读取 `responseBody` ✅ |
+| 中止机制 | `shouldAbortUpload=true` → 退出循环 ✅ | **无中止**，`shouldAbortQueuingTasks` 只在 `cancel()` 中设 true ✅ |
+| 重试行为 | 无自动重试 ✅ | `retries:3` → 最多 4 次请求 ✅ |
+| 用户可见 | `callbacks.onError` → UI 提示 ✅ | **静默**，无 UI 回调 ✅ |
+| 批量继续 | 命中超限后退出循环 ✅ | 仅单次入队 100 个，无后续循环 ✅ |
 
-**后台上传的隐式行为**：
+**代码事实 ✅**：
+- `uploadBackupCandidates`（`background_upload.service.dart:171-185`）只取前 100 个候选资产入队一次，没有 `while` 循环。一批处理完（无论成功失败）后不会自动拉取下一批。
+- 下一批只有在 iOS 系统再次触发后台任务时才会入队。因此**不会无限循环**，每次系统调度最多浪费 100 × 4 = 400 次请求。
 
-1. `TaskStatusUpdate` 的 `responseBody` 字段**在 `TaskStatus.complete` 时可用**（`_handleLivePhoto` 用它解析 `response['id']`），在 `TaskStatus.failed` 时同样可用——但代码从未读取。
-2. 每个 UploadTask 的 `retries: 3` 意味着配额超限时，每个资产会向服务器发送 4 次请求（1 次原始 + 3 次重试），全部返回 400，最终才标记为 `TaskStatus.failed`。
-3. `uploadBackupCandidates` 只取前 100 个候选资产入队，没有循环拉取下一批——因此实际上只会浪费 100 × 4 = 400 次请求，而不是无限循环。但在 100 个全部失败后，下次后台触发时会再次取 100 个，继续浪费请求。
-4. `shouldAbortQueuingTasks` 只在 `cancel()` 中被设为 `true`，而 `cancel()` 只在用户登出或手动停止备份时调用——后台触发的上传从不主动取消。
+#### 5.5.6 taskStatusStream 的断点分析
+
+`taskStatusStream` 被定义（`background_upload.service.dart:119-122`）但从未被消费，存在以下断点：
+
+1. **事件黑洞**：`_taskStatusController.add(update)` 向 broadcast stream 投递事件，但没有 listener，事件立即被丢弃。
+2. **无二次处理**：DriftBackupNotifier（`drift_backup.provider.dart:189`）持有 `_backgroundUploadService` 引用，但从未订阅 `taskStatusStream`。
+3. **UI 无感知**：没有任何 Widget 或 Notifier 监听失败状态更新，因此 UI 无法展示配额超限错误。
+4. **日志缺失**：`default` 分支甚至没有 `_logger.warning()` 或 `_logger.severe()` 调用，错误完全不留痕迹。
 
 ### 5.6 后台备份触发机制
 
@@ -488,9 +530,17 @@ if (config.nightlyTasks.syncQuotaUsage) {
 
 5. **外部库资产不计入**：`libraryId IS NOT NULL` 的资产（外部挂载）不占用配额，上传、删除时都不触发 `updateUsage`。
 
-6. **iOS 后台上传的静默失败**：`background_upload.service.dart:207` 的 `_handleTaskStatusUpdate` 不处理 `TaskStatus.failed`，配额超限错误被完全忽略。配合 `retries: 3`，每次后台备份会产生 100 × 4 = 400 次无效请求，且用户在 App 内看不到任何错误提示。详见 5.5 节。
+6. **iOS 后台上传的静默失败**（代码事实 ✅）：
+   - `background_upload.service.dart:207` 的 `_handleTaskStatusUpdate` 不处理 `TaskStatus.failed`，配额超限错误被完全忽略。
+   - `taskStatusStream` 定义但未被任何地方 `.listen()`，事件被丢弃。
+   - `default` 分支无日志，错误不留痕迹。
+   - 配合 `retries: 3`，每次后台备份会产生最多 100 × 4 = 400 次无效请求（代码事实 ✅），但不会无限循环（单次入队 100 个后停止，下一批需等待系统再次触发）。
+   - `responseBody` 在 `TaskStatus.failed` 状态下可用的结论属于合理推断 ⚠️，基于 SDK 文档，但 Immich 代码未验证。
 
-7. **前后台行为不一致**：前台上传能检测到配额超限并中止整个备份循环；后台上传（iOS URLSession）不做任何检测，继续尝试上传下一批候选资产。这导致前台用户看到"备份已完成"但后台仍在静默浪费请求。
+7. **前后台行为不一致**（代码事实 ✅）：
+   - 前台上传能检测到配额超限并中止整个备份循环；
+   - 后台上传（iOS URLSession）不做任何检测，单次入队 100 个后自然停止。
+   - 两者的错误可见性差异：前台通过 `callbacks.onError` 提示用户，后台完全静默。
 
 ## 9. 关键代码索引
 
