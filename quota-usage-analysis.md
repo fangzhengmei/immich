@@ -277,6 +277,82 @@ if (user != null && user.hasQuota) {
 
 用 `LinearProgressIndicator` 展示进度条，下方显示 `X used of Y`。这是**被动展示**，进度条不会在即将超限时变红或弹出警告——只有真正发起上传被 400 拒绝时用户才会收到提示。
 
+### 5.5 iOS 后台 URLSession 上传的配额超限处理（关键差异）
+
+iOS 后台备份使用 `background_downloader` 包（基于 `URLSession`）进行异步上传，与前台上传的错误处理路径有本质区别。
+
+**后台上传链路**：
+
+```
+DriftBackupNotifier.startBackupWithURLSession()
+  drift_backup.provider.dart:376
+  ↓
+BackgroundUploadService.uploadBackupCandidates(userId)
+  background_upload.service.dart:159
+  ↓
+  取前 100 个候选资产
+  构建 UploadTask（retries: 3）
+  enqueueTasks(tasks)  →  FileDownloader().enqueueAll()
+  ↓
+URLSession 后台上传（App 可挂起）
+  ↓
+TaskStatusUpdate 回调  →  _onUploadCallback()  background_upload.service.dart:133
+  ↓
+_handleTaskStatusUpdate(update)  background_upload.service.dart:207
+  ├─ TaskStatus.complete  →  处理 Live Photo 后续上传 + iOS 临时文件清理
+  └─ default              →  break （无任何处理！）
+```
+
+**`_handleTaskStatusUpdate` 的关键代码**（`background_upload.service.dart:207-226`）：
+
+```dart
+void _handleTaskStatusUpdate(TaskStatusUpdate update) async {
+  switch (update.status) {
+    case TaskStatus.complete:
+      unawaited(_handleLivePhoto(update));
+      if (CurrentPlatform.isIOS) {
+        try {
+          final path = await update.task.filePath();
+          await File(path).delete();
+        } catch (e) {
+          _logger.severe('Error deleting file path for iOS: $e');
+        }
+      }
+      break;
+    default:
+      break;  // TaskStatus.failed 直接忽略，无任何逻辑
+  }
+}
+```
+
+**与前台上传的对比**：
+
+| 维度 | 前台上传 | 后台上传（URLSession） |
+| --- | --- | --- |
+| 错误解析 | 同步检查 `UploadResult.errorMessage` | **无解析**，`TaskStatus.failed` 被忽略 |
+| 配额超限检测 | `result.errorMessage == "Quota has been exceeded!"` | **无检测**，不读取 `responseBody` |
+| 中止机制 | `shouldAbortUpload = true` → 退出 worker 循环 | **无中止**，`shouldAbortQueuingTasks` 只在 `cancel()` 中设为 true |
+| 重试行为 | 无自动重试，由上层 `_executeWithWorkerPool` 控制 | `retries: 3`（`background_upload.service.dart:435`），自动重试 3 次 |
+| 错误对用户可见 | `callbacks.onError` 回调 → UI 提示 | **无回调**，`TaskStatus.failed` 被静默忽略 |
+| 批量继续 | 命中超限后退出循环，不再上传剩余资产 | 继续上传下一批 100 个候选资产，无上限检查 |
+
+**后台上传的隐式行为**：
+
+1. `TaskStatusUpdate` 的 `responseBody` 字段**在 `TaskStatus.complete` 时可用**（`_handleLivePhoto` 用它解析 `response['id']`），在 `TaskStatus.failed` 时同样可用——但代码从未读取。
+2. 每个 UploadTask 的 `retries: 3` 意味着配额超限时，每个资产会向服务器发送 4 次请求（1 次原始 + 3 次重试），全部返回 400，最终才标记为 `TaskStatus.failed`。
+3. `uploadBackupCandidates` 只取前 100 个候选资产入队，没有循环拉取下一批——因此实际上只会浪费 100 × 4 = 400 次请求，而不是无限循环。但在 100 个全部失败后，下次后台触发时会再次取 100 个，继续浪费请求。
+4. `shouldAbortQueuingTasks` 只在 `cancel()` 中被设为 `true`，而 `cancel()` 只在用户登出或手动停止备份时调用——后台触发的上传从不主动取消。
+
+### 5.6 后台备份触发机制
+
+iOS 后台备份通过原生 `BackgroundWorker` 触发，而非 App 内调度：
+
+- Swift 端：`mobile/ios/Runner/Background/BackgroundWorker.swift` 处理系统级后台任务回调
+- Pigeon 桥接：`mobile/pigeon/background_worker_api.dart:44` 的 `onIosUpload` 方法被原生调用时，Dart 侧执行 `startBackupWithURLSession`
+- 系统调度：iOS 根据设备空闲、充电、网络等条件决定何时触发后台任务
+
+这意味着用户**无法在 App 内实时看到后台上传的配额超限错误**——错误只存在于服务器日志和客户端 `background_downloader` 的本地数据库中，不进入 UI。
+
 ## 6. 缓存对齐机制
 
 `quotaUsageInBytes` 是缓存，真实口径在 `asset_exif.fileSizeInByte`。对齐手段有两类：
@@ -325,9 +401,15 @@ if (config.nightlyTasks.syncQuotaUsage) {
                        ▼                       ▼                       ▼
               Web 拖拽上传             移动端备份任务          移动端手动上传
                        │                       │                       │
-                       └───────────────────────┼───────────────────────┘
-                                               │
-                                               ▼
+                       │             ┌─────────┴─────────┐             │
+                       │             │                   │             │
+                       │             ▼                   ▼             │
+                       │       前台同步上传       iOS 后台 URLSession    │
+                       │       (_processAsset)    (BackgroundUpload)   │
+                       │             │                   │             │
+                       └─────────────┼───────────────────┼─────────────┘
+                                     │                   │
+                                     ▼                   ▼
                                    ┌─────────────────────────┐
                                    │  POST /assets  (HTTP)    │
                                    └───────────┬─────────────┘
@@ -355,18 +437,18 @@ if (config.nightlyTasks.syncQuotaUsage) {
                                              ▼
                                    HTTP 400 JSON Response
                                              │
-                       ┌─────────────────────┼─────────────────────┐
-                       │                     │                     │
-                       ▼                     ▼                     ▼
-                Web 端处理             移动端处理             SDK HttpError
-                       │                     │                     │
-  ┌──────────────────────────┐  ┌──────────────────────────┐
-  │ handleError()            │  │ 错误消息字符串匹配        │
-  │ getServerErrorMessage()  │  │ "Quota has been exceeded!"│
-  │ toastManager.danger()    │  │ shouldAbortUpload = true │
-  │ uploadAssetsStore ERROR  │  │ 中止整个备份队列         │
-  │ 显示红色 toast + 重试按钮 │  │ UI 展示错误信息         │
-  └──────────────────────────┘  └──────────────────────────┘
+              ┌──────────────────────────────┼──────────────────────────────┐
+              │                              │                              │
+              ▼                              ▼                              ▼
+        Web 端处理                前台移动端处理                后台移动端处理
+              │                              │                              │
+  ┌──────────────────────┐  ┌──────────────────────────┐  ┌──────────────────────────┐
+  │ handleError()        │  │ 错误消息字符串匹配        │  │ _handleTaskStatusUpdate │
+  │ getServerErrorMessage│  │ "Quota has been exceeded!"│  │ TaskStatus.failed → 忽略  │
+  │ toastManager.danger  │  │ shouldAbortUpload=true  │  │ 无 responseBody 解析     │
+  │ uploadAssetsStore    │  │ 中止 worker 循环         │  │ retries:3 → 3 次重试     │
+  │ 红色 toast + 重试按钮 │  │ callbacks.onError→UI    │  │ 错误静默，用户不可见     │
+  └──────────────────────┘  └──────────────────────────┘  └──────────────────────────┘
 ```
 
 删除方向的对称链路：
@@ -406,6 +488,10 @@ if (config.nightlyTasks.syncQuotaUsage) {
 
 5. **外部库资产不计入**：`libraryId IS NOT NULL` 的资产（外部挂载）不占用配额，上传、删除时都不触发 `updateUsage`。
 
+6. **iOS 后台上传的静默失败**：`background_upload.service.dart:207` 的 `_handleTaskStatusUpdate` 不处理 `TaskStatus.failed`，配额超限错误被完全忽略。配合 `retries: 3`，每次后台备份会产生 100 × 4 = 400 次无效请求，且用户在 App 内看不到任何错误提示。详见 5.5 节。
+
+7. **前后台行为不一致**：前台上传能检测到配额超限并中止整个备份循环；后台上传（iOS URLSession）不做任何检测，继续尝试上传下一批候选资产。这导致前台用户看到"备份已完成"但后台仍在静默浪费请求。
+
 ## 9. 关键代码索引
 
 | 主题 | 文件 | 行号 |
@@ -425,8 +511,16 @@ if (config.nightlyTasks.syncQuotaUsage) {
 | OAuth 配额注入 | `server/src/services/auth.service.ts` | 371 |
 | Web 端错误处理 | `web/src/lib/utils/handle-error.ts` | 4, 38 |
 | Web 端上传错误捕获 | `web/src/lib/utils/file-uploader.ts` | 255, 262 |
-| 移动端上传 Repository | `mobile/lib/repositories/upload.repository.dart` | 117, 126 |
-| 移动端配额字符串匹配 | `mobile/lib/services/foreground_upload.service.dart` | 399 |
+| 前台上传配额检测 | `mobile/lib/services/foreground_upload.service.dart` | 399 |
+| 前台上传中止循环 | `mobile/lib/services/foreground_upload.service.dart` | 207 |
+| 后台上传服务入口 | `mobile/lib/services/background_upload.service.dart` | 159, 207 |
+| 后台上传错误处理（缺失） | `mobile/lib/services/background_upload.service.dart` | 207-226 |
+| 后台上传任务构建 | `mobile/lib/services/background_upload.service.dart` | 372, 435 |
+| 后台上传 Repository | `mobile/lib/repositories/upload.repository.dart` | 40, 91 |
+| 前台上传 Repository | `mobile/lib/repositories/upload.repository.dart` | 91 |
 | 移动端配额进度展示 | `mobile/lib/widgets/common/app_bar_dialog/app_bar_dialog.dart` | 147 |
 | SDK HttpError 类型 | `packages/sdk/src/fetch-errors.ts` | 16, 20 |
+| 后台备份入口 | `mobile/lib/providers/backup/drift_backup.provider.dart` | 376 |
+| iOS 后台 Worker（Swift） | `mobile/ios/Runner/Background/BackgroundWorker.swift` | — |
+| Pigeon 桥接 | `mobile/pigeon/background_worker_api.dart` | 44 |
 
